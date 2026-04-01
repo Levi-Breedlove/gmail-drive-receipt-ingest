@@ -31,6 +31,7 @@ The output filenames are designed to be cleaner and more searchable by using:
 - Marks processed messages to prevent duplicate ingestion
 - Supports dry-run testing before real file writes
 - Generates cleaner filenames based on extracted receipt information
+- Restricts processing to emails dated **2026-01-01 and onward**
 
 ## Current Output Behavior
 
@@ -39,10 +40,18 @@ For each processed email, the workflow saves:
 1. **Email body PDF**
    - rendered from the email body
    - inline images are preserved as closely as possible
+   - remote image fetching is limited to avoid bloated or looping image fetches
 
 2. **Original attachments**
    - PDF, PNG, JPG, and other supported files
    - stored in an `_attachments` subfolder when present
+
+The current workflow does **not** save:
+
+- HTML body files
+- raw `.eml` files
+- manifest JSON files
+- full rendered PNG screenshots of the email body
 
 ## Folder Structure
 
@@ -146,7 +155,9 @@ LABELS=bob-expenses,sarah-expenses,mike-expenses
 
 ### Step 3: Update the label-to-folder mapping in code
 
-If your current script still uses a hardcoded `mapLabelToPerson_()` function, update it so the new label names route to the correct Drive folder names.
+The current script uses a hardcoded `mapLabelToPerson_()` function.
+
+If you change the label names, you must also change the mapping.
 
 Example:
 
@@ -188,8 +199,8 @@ function setupConfig() {
       LABELS: 'archana-expenses,dan-expenses,rhea-expenses',
       TIMEZONE: 'America/Los_Angeles',
       DRY_RUN: 'true',
+      MIN_EMAIL_DATE: '2026-01-01',
 
-      // Artifact controls
       SAVE_HTML: 'false',
       SAVE_PDF: 'true',
       SAVE_RAW_EMAIL: 'false',
@@ -286,6 +297,44 @@ REVIEW_LABEL: 'receipt-needs-review-test'
 
 If you rename those, make sure the new labels exist in Gmail too.
 
+## Date Filtering
+
+The current workflow only processes emails from **2026-01-01 and onward**.
+
+This is controlled by the `MIN_EMAIL_DATE` setting.
+
+Example:
+
+```javascript
+MIN_EMAIL_DATE: '2026-01-01',
+```
+
+The script enforces this in two ways:
+
+1. it adds an `after:` filter to the Gmail search query
+2. it checks each message date again in code before processing
+
+### How to change the minimum date
+
+If you want to change the date cutoff, update:
+
+```javascript
+MIN_EMAIL_DATE: '2026-01-01',
+```
+
+to something else, for example:
+
+```javascript
+MIN_EMAIL_DATE: '2027-01-01',
+```
+
+Then re-run:
+
+```javascript
+setupConfig()
+dryRunScan()
+```
+
 ## Required Google Apps Script Services
 
 ### Built-in services
@@ -348,6 +397,7 @@ Typical properties include:
 - `LABELS`
 - `TIMEZONE`
 - `DRY_RUN`
+- `MIN_EMAIL_DATE`
 - `SAVE_PDF`
 - `SAVE_ATTACHMENTS`
 
@@ -394,6 +444,34 @@ installWeeklyTrigger()
 
 This creates a recurring trigger for `runReceiptIngestion()`.
 
+### Current trigger behavior
+
+The current helper creates a weekly trigger for:
+
+- `runReceiptIngestion()`
+- Friday
+- around 5 PM
+
+## Running This Script in Another Person's Gmail Account
+
+If this workflow is used in another person’s Gmail account, that person should authorize the script and create the installable trigger from their own account.
+
+Recommended setup for another user:
+
+1. copy or open the script in that user’s Google account
+2. enable the required Apps Script services
+3. authorize the script from that user’s account
+4. create the Gmail labels in that user’s Gmail
+5. create the Drive folders in that user’s Google Drive
+6. run:
+   - `setupConfig()`
+   - `verifySetup()`
+   - `dryRunScan()`
+7. install the trigger by running:
+   - `installWeeklyTrigger()`
+
+If the trigger is created by a different account, the workflow may run under the wrong Gmail / Drive context.
+
 ## Key Functions
 
 ### `setupConfig()`
@@ -406,7 +484,7 @@ Verifies Gmail labels, Drive folders, manifest access, and required service acce
 
 ### `dryRunScan()`
 
-Parses messages without writing files, so you can verify vendor extraction, order number extraction, attachment detection, and PDF naming safely.
+Parses messages without writing files, so you can verify vendor extraction, order number extraction, attachment detection, minimum date filtering, and PDF naming safely.
 
 ### `resetTestProcessedState()`
 
@@ -457,6 +535,23 @@ Deleting the generated files from Drive does not automatically make the emails e
 resetTestProcessedState()
 ```
 
+## How Remote Images Are Handled
+
+The script attempts to preserve images in the rendered PDF by:
+
+1. embedding `cid:` inline images from the email MIME parts
+2. fetching a limited number of remote `<img src="...">` images
+3. converting those images into data URIs before PDF conversion
+
+To avoid bloated loops or noisy ride / marketing emails, the script also:
+
+- caps remote image fetches
+- skips obvious tracking and beacon URLs
+- skips many static map / marker URLs
+- skips extremely long signed URLs
+
+This helps keep PDF generation more reliable while still preserving the most important visible email images.
+
 ## Limitations
 
 This project is intentionally Apps Script-only.
@@ -467,6 +562,7 @@ That means:
 - visual fidelity is strong, but not the same as a true browser screenshot renderer
 - a full rendered email-body PNG screenshot is not supported cleanly in Apps Script-only server-side automation
 - vendor extraction is heuristic, not guaranteed for every merchant format
+- some heavily proxied or authenticated remote images may still fail to appear in the PDF
 
 The best artifact in this workflow is the rendered PDF plus the original saved attachments.
 
