@@ -58,16 +58,16 @@ The current workflow does **not** save:
 ```text
 Receipts Archive/
   _TEST/
-    archana/
+    user1/
       2026/
         2026-03/
           31Mar-HampersAndCo-W56606-email-body.pdf
           _attachments/
             31Mar-HampersAndCo-W56606-original-file.pdf
-    dan/
+    user2/
       2026/
         2026-03/
-    rhea/
+    user3/
       2026/
         2026-03/
     _Needs Review/
@@ -105,9 +105,7 @@ Example:
 
 The workflow currently expects Gmail labels like:
 
-- `archana-expenses`
-- `dan-expenses`
-- `rhea-expenses`
+- `user1-expenses`
 
 It also uses processing labels such as:
 
