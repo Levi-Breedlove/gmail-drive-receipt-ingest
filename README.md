@@ -96,9 +96,7 @@ Example:
 
 The workflow expects Gmail labels like:
 
-- `archana-expenses`
-- `dan-expenses`
-- `rhea-expenses`
+- `johndoe-expenses`
 
 It also uses processing labels such as:
 
