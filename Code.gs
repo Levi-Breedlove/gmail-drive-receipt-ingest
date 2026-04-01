@@ -36,6 +36,8 @@ function setupConfig() {
       LABELS: 'archana-expenses,dan-expenses,rhea-expenses',
       TIMEZONE: 'America/Los_Angeles',
       DRY_RUN: 'true',
+      MIN_EMAIL_DATE: '2026-01-01',
+
 
       // Artifact controls
       SAVE_HTML: 'false',
@@ -65,6 +67,7 @@ function getConfig_() {
       .filter(Boolean),
     timezone: props.getProperty('TIMEZONE') || 'America/Los_Angeles',
     dryRun: String(props.getProperty('DRY_RUN')).toLowerCase() === 'true',
+    minEmailDate: props.getProperty('MIN_EMAIL_DATE') || '2026-01-01',
 
     saveHtml: String(props.getProperty('SAVE_HTML')).toLowerCase() === 'true',
     savePdf: String(props.getProperty('SAVE_PDF')).toLowerCase() === 'true',
@@ -74,6 +77,28 @@ function getConfig_() {
     saveInlineImageFiles:
       String(props.getProperty('SAVE_INLINE_IMAGE_FILES')).toLowerCase() === 'true'
   };
+}
+
+/* =========================
+ * DATE FILTER HELPERS
+ * ========================= */
+
+function getAfterQueryDate_(minEmailDate) {
+  // Gmail search "after:" is exclusive, so to include 2026-01-01
+  // we search after the previous day.
+  const minDate = new Date(`${minEmailDate}T00:00:00`);
+  const previousDay = new Date(minDate.getTime() - 24 * 60 * 60 * 1000);
+
+  return Utilities.formatDate(
+    previousDay,
+    Session.getScriptTimeZone(),
+    'yyyy/MM/dd'
+  );
+}
+
+function isMessageOnOrAfterMinDate_(message, minEmailDate) {
+  const boundary = new Date(`${minEmailDate}T00:00:00`);
+  return message.getDate().getTime() >= boundary.getTime();
 }
 
 function setDryRunTrue() {
@@ -173,9 +198,11 @@ function dryRunScan() {
 
   Logger.log('--- DRY RUN SCAN START ---');
   Logger.log(`DRY_RUN = ${config.dryRun}`);
+  Logger.log(`MIN_EMAIL_DATE = ${config.minEmailDate}`);
 
   config.labels.forEach(labelName => {
-    const query = `label:${labelName} -label:${config.processedLabel}`;
+    const afterDate = getAfterQueryDate_(config.minEmailDate);
+    const query = `label:${labelName} -label:${config.processedLabel} after:${afterDate}`;
     const threads = GmailApp.search(query, 0, 50);
 
     Logger.log(`Label: ${labelName}`);
@@ -186,6 +213,13 @@ function dryRunScan() {
 
       if (!message) {
         Logger.log(`No usable message found in thread ${thread.getId()}`);
+        return;
+      }
+
+      if (!isMessageOnOrAfterMinDate_(message, config.minEmailDate)) {
+        Logger.log(
+          `Skipping pre-${config.minEmailDate} message ${message.getId()} with date ${message.getDate().toISOString()}`
+        );
         return;
       }
 
@@ -282,16 +316,27 @@ function runReceiptIngestion() {
 }
 
 function processLabel_(labelName, config, summary) {
-  const query = `label:${labelName} -label:${config.processedLabel}`;
+  const afterDate = getAfterQueryDate_(config.minEmailDate);
+  const query = `label:${labelName} -label:${config.processedLabel} after:${afterDate}`;
   const threads = GmailApp.search(query, 0, 100);
 
-  Logger.log(`Processing label ${labelName} with ${threads.length} matching threads`);
+  Logger.log(
+    `Processing label ${labelName} with ${threads.length} matching threads from ${config.minEmailDate} onward`
+  );
 
   threads.forEach(thread => {
     summary.scannedThreads += 1;
 
     const message = getTargetMessageFromThread_(thread);
     if (!message) {
+      summary.skipped += 1;
+      return;
+    }
+
+    if (!isMessageOnOrAfterMinDate_(message, config.minEmailDate)) {
+      Logger.log(
+        `Skipping pre-${config.minEmailDate} message ${message.getId()} with date ${message.getDate().toISOString()}`
+      );
       summary.skipped += 1;
       return;
     }
@@ -641,29 +686,38 @@ function buildRenderableEmailHtml_(message, parsed) {
   return ensureHtmlDocument_(html, message.getSubject() || '(no subject)');
 }
 
+function normalizeFetchableUrl_(url) {
+  let value = String(url || '').trim();
+
+  if (!value) {
+    return '';
+  }
+
+  if (value.indexOf('//') === 0) {
+    value = 'https:' + value;
+  }
+
+  // Normalize HTML-escaped ampersands in query strings.
+  value = value.replace(/&amp;/g, '&');
+
+  return value;
+}
+
 function inlineRemoteImagesAsDataUris_(html) {
   let value = String(html || '');
   if (!value) return value;
 
+  // Only collect real <img src="..."> URLs.
   const urls = collectRemoteImageUrls_(value);
   if (urls.length === 0) return value;
 
   const replacements = fetchImageDataUris_(urls);
 
-  // Replace img src URLs
+  // Replace img src URLs only.
   value = value.replace(/src=(["'])(https?:\/\/[^"']+|\/\/[^"']+)\1/gi, function (match, quote, url) {
     const normalized = normalizeFetchableUrl_(url);
     if (replacements[normalized]) {
       return `src=${quote}${replacements[normalized]}${quote}`;
-    }
-    return match;
-  });
-
-  // Replace CSS url(...) references too
-  value = value.replace(/url\((["']?)(https?:\/\/[^"')]+|\/\/[^"')]+)\1\)/gi, function (match, quote, url) {
-    const normalized = normalizeFetchableUrl_(url);
-    if (replacements[normalized]) {
-      return `url(${replacements[normalized]})`;
     }
     return match;
   });
@@ -674,34 +728,26 @@ function inlineRemoteImagesAsDataUris_(html) {
 function collectRemoteImageUrls_(html) {
   const found = {};
   const urls = [];
+  const MAX_REMOTE_IMAGES = 12;
 
-  html.replace(/src=(["'])(https?:\/\/[^"']+|\/\/[^"']+)\1/gi, function (_match, _quote, url) {
+  // Only collect actual image tags, not CSS background URLs.
+  html.replace(/<img[^>]+src=(["'])(https?:\/\/[^"']+|\/\/[^"']+)\1/gi, function (_match, _quote, url) {
     const normalized = normalizeFetchableUrl_(url);
+
+    if (!shouldFetchRemoteImageUrl_(normalized)) {
+      return _match;
+    }
+
     if (!found[normalized]) {
       found[normalized] = true;
       urls.push(normalized);
     }
+
     return _match;
   });
 
-  html.replace(/url\((["']?)(https?:\/\/[^"')]+|\/\/[^"')]+)\1\)/gi, function (_match, _quote, url) {
-    const normalized = normalizeFetchableUrl_(url);
-    if (!found[normalized]) {
-      found[normalized] = true;
-      urls.push(normalized);
-    }
-    return _match;
-  });
-
-  return urls;
-}
-
-function normalizeFetchableUrl_(url) {
-  let value = String(url || '').trim();
-  if (value.indexOf('//') === 0) {
-    value = 'https:' + value;
-  }
-  return value;
+  // Hard cap to avoid huge emails like Uber / marketing blasts causing fetch storms.
+  return urls.slice(0, MAX_REMOTE_IMAGES);
 }
 
 function fetchImageDataUris_(urls) {
@@ -758,9 +804,42 @@ function fetchImageDataUris_(urls) {
 
   return map;
 }
+
 /* =========================
  * HTML / MIME HELPERS
  * ========================= */
+function shouldFetchRemoteImageUrl_(url) {
+  const value = String(url || '').trim().toLowerCase();
+  if (!value) return false;
+
+  // Skip insane signed URLs that blow up UrlFetch limits.
+  if (value.length > 1800) return false;
+
+  // Skip obvious trackers / beacons / analytics pixels.
+  if (
+    /pixel|tracking|beacon|analytics|openrate|impression/.test(value)
+  ) {
+    return false;
+  }
+
+  // Skip most static map / marker spam from ride emails.
+  if (
+    /static-?map|maps\.uber|mapbox|marker=|markers=|waypoint/.test(value)
+  ) {
+    return false;
+  }
+
+  // Skip already embedded / unsupported schemes.
+  if (
+    value.startsWith('data:') ||
+    value.startsWith('cid:') ||
+    value.startsWith('blob:')
+  ) {
+    return false;
+  }
+
+  return true;
+}
 
 function ensureHtmlDocument_(html, title) {
   let value = stripScriptsOnly_(String(html || '').trim());
