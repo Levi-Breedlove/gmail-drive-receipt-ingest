@@ -1,7 +1,7 @@
 /**
  * Receipt ingestion MVP for Gmail -> Google Drive
  *
- * Apps Script-only fidelity version:
+ * What this version does:
  * - Uses Advanced Gmail service for richer MIME/body access
  * - Saves a PDF converted from a self-contained HTML snapshot of the email body
  * - Saves regular attachments separately
@@ -10,10 +10,18 @@
  * - Skips remote image failures and keeps moving
  * - Limits ingestion to March 2026 and onward by default
  * - Prevents duplicate crawling with both Gmail message ID tracking and receipt-level dedupe
+ * - Ignores obvious non-receipt threads even if they were labeled by mistake
+ * - Sends borderline messages to review instead of ingesting them
+ *
+ * Important:
+ * Gmail labels are thread-level. Because of that, this script does NOT exclude
+ * processed/review/ignored labels from search. It always scans candidate expense
+ * threads, then decides at the message level what to do. That avoids hiding a
+ * later real receipt inside a thread that was previously reviewed or ignored.
  *
  * Required services:
- * - Built-in: GmailApp, DriveApp, PropertiesService, LockService, ScriptApp
- * - Advanced: Gmail
+ * - Built-in: GmailApp, DriveApp, PropertiesService, LockService, ScriptApp, UrlFetchApp
+ * - Advanced Gmail service: Gmail
  */
 
 /* =========================
@@ -29,21 +37,28 @@ function setupConfig() {
       TEST_SUBROOT_NAME: '_TEST',
       PROCESSED_LABEL: 'receipt-ingested-test',
       REVIEW_LABEL: 'receipt-needs-review-test',
+      IGNORED_LABEL: 'receipt-ignored-nonreceipt-test',
       LABELS: 'archana-expenses,dan-expenses,rhea-expenses',
       TIMEZONE: 'America/Los_Angeles',
       DRY_RUN: 'true',
       MIN_EMAIL_DATE: '2026-03-01',
 
+      // Classification thresholds
+      RECEIPT_THRESHOLD: '4',
+      REVIEW_THRESHOLD: '2',
+
       // Artifact controls
       SAVE_HTML: 'false',
       SAVE_PDF: 'true',
-      SAVE_RAW_EMAIL: 'false',
       SAVE_MANIFEST: 'false',
       SAVE_ATTACHMENTS: 'true',
       SAVE_INLINE_IMAGE_FILES: 'false',
 
-      // Fetch remote images for better PDF fidelity, but do it best-effort only.
-      FETCH_REMOTE_IMAGES: 'true'
+      // Fetch remote images for better PDF fidelity, best-effort only.
+      FETCH_REMOTE_IMAGES: 'true',
+
+      // New: do not save .eml attachments
+      IGNORE_EML_ATTACHMENTS: 'true'
     },
     true
   );
@@ -59,17 +74,19 @@ function getConfig_() {
     testSubrootName: props.getProperty('TEST_SUBROOT_NAME') || '_TEST',
     processedLabel: props.getProperty('PROCESSED_LABEL') || 'receipt-ingested-test',
     reviewLabel: props.getProperty('REVIEW_LABEL') || 'receipt-needs-review-test',
+    ignoredLabel: props.getProperty('IGNORED_LABEL') || 'receipt-ignored-nonreceipt-test',
     labels: (props.getProperty('LABELS') || '')
       .split(',')
-      .map(s => s.trim())
+      .map(function (s) { return s.trim(); })
       .filter(Boolean),
     timezone: props.getProperty('TIMEZONE') || 'America/Los_Angeles',
     dryRun: String(props.getProperty('DRY_RUN')).toLowerCase() === 'true',
     minEmailDate: props.getProperty('MIN_EMAIL_DATE') || '2026-03-01',
+    receiptThreshold: Number(props.getProperty('RECEIPT_THRESHOLD') || '4'),
+    reviewThreshold: Number(props.getProperty('REVIEW_THRESHOLD') || '2'),
 
     saveHtml: String(props.getProperty('SAVE_HTML')).toLowerCase() === 'true',
     savePdf: String(props.getProperty('SAVE_PDF')).toLowerCase() === 'true',
-    saveRawEmail: String(props.getProperty('SAVE_RAW_EMAIL')).toLowerCase() === 'true',
     saveManifest: String(props.getProperty('SAVE_MANIFEST')).toLowerCase() === 'true',
     saveAttachments: String(props.getProperty('SAVE_ATTACHMENTS')).toLowerCase() === 'true',
     saveInlineImageFiles:
@@ -84,20 +101,16 @@ function getConfig_() {
  * ========================= */
 
 function getAfterQueryDate_(minEmailDate) {
-  // Gmail search "after:" is exclusive, so to include the configured date
-  // we search after the previous day.
-  const minDate = new Date(`${minEmailDate}T00:00:00`);
+  // Gmail "after:" is exclusive. To include the configured date,
+  // search after the previous day.
+  const minDate = new Date(minEmailDate + 'T00:00:00');
   const previousDay = new Date(minDate.getTime() - 24 * 60 * 60 * 1000);
 
-  return Utilities.formatDate(
-    previousDay,
-    Session.getScriptTimeZone(),
-    'yyyy/MM/dd'
-  );
+  return Utilities.formatDate(previousDay, Session.getScriptTimeZone(), 'yyyy/MM/dd');
 }
 
 function isMessageOnOrAfterMinDate_(message, minEmailDate) {
-  const boundary = new Date(`${minEmailDate}T00:00:00`);
+  const boundary = new Date(minEmailDate + 'T00:00:00');
   return message.getDate().getTime() >= boundary.getTime();
 }
 
@@ -123,47 +136,38 @@ function verifySetup() {
   assertAdvancedGmailEnabled_();
   Logger.log('Advanced Gmail service OK');
 
-  config.labels.forEach(labelName => {
+  config.labels.forEach(function (labelName) {
     const label = GmailApp.getUserLabelByName(labelName);
-    Logger.log(label ? `Label OK: ${labelName}` : `Label MISSING: ${labelName}`);
+    Logger.log(label ? 'Label OK: ' + labelName : 'Label MISSING: ' + labelName);
   });
 
-  const processedLabel = GmailApp.getUserLabelByName(config.processedLabel);
-  Logger.log(
-    processedLabel
-      ? `Processed label OK: ${config.processedLabel}`
-      : `Processed label MISSING: ${config.processedLabel}`
-  );
-
-  const reviewLabel = GmailApp.getUserLabelByName(config.reviewLabel);
-  Logger.log(
-    reviewLabel
-      ? `Review label OK: ${config.reviewLabel}`
-      : `Review label MISSING: ${config.reviewLabel}`
-  );
+  [config.processedLabel, config.reviewLabel, config.ignoredLabel].forEach(function (name) {
+    const label = GmailApp.getUserLabelByName(name);
+    Logger.log(label ? 'Label OK: ' + name : 'Label MISSING: ' + name);
+  });
 
   const root = findFolderByName_(config.rootFolderName);
   if (!root) {
-    Logger.log(`Folder MISSING: ${config.rootFolderName}`);
+    Logger.log('Folder MISSING: ' + config.rootFolderName);
     Logger.log('--- VERIFY SETUP END ---');
     return;
   }
-  Logger.log(`Folder OK: ${config.rootFolderName}`);
+  Logger.log('Folder OK: ' + config.rootFolderName);
 
   const testRoot = findChildFolderByName_(root, config.testSubrootName);
   if (!testRoot) {
-    Logger.log(`Folder MISSING: ${config.rootFolderName}/${config.testSubrootName}`);
+    Logger.log('Folder MISSING: ' + config.rootFolderName + '/' + config.testSubrootName);
     Logger.log('--- VERIFY SETUP END ---');
     return;
   }
-  Logger.log(`Folder OK: ${config.rootFolderName}/${config.testSubrootName}`);
+  Logger.log('Folder OK: ' + config.rootFolderName + '/' + config.testSubrootName);
 
-  ['archana', 'dan', 'rhea', '_Needs Review', '_Logs'].forEach(name => {
+  ['archana', 'dan', 'rhea', '_Needs Review', '_Logs'].forEach(function (name) {
     const child = findChildFolderByName_(testRoot, name);
     Logger.log(
       child
-        ? `Folder OK: ${config.rootFolderName}/${config.testSubrootName}/${name}`
-        : `Folder MISSING: ${config.rootFolderName}/${config.testSubrootName}/${name}`
+        ? 'Folder OK: ' + config.rootFolderName + '/' + config.testSubrootName + '/' + name
+        : 'Folder MISSING: ' + config.rootFolderName + '/' + config.testSubrootName + '/' + name
     );
   });
 
@@ -172,14 +176,18 @@ function verifySetup() {
 
 function createMissingLabels() {
   const config = getConfig_();
-  const needed = [...config.labels, config.processedLabel, config.reviewLabel];
+  const needed = [
+    config.processedLabel,
+    config.reviewLabel,
+    config.ignoredLabel
+  ].concat(config.labels);
 
-  needed.forEach(name => {
+  needed.forEach(function (name) {
     if (!GmailApp.getUserLabelByName(name)) {
       GmailApp.createLabel(name);
-      Logger.log(`Created label: ${name}`);
+      Logger.log('Created label: ' + name);
     } else {
-      Logger.log(`Already exists: ${name}`);
+      Logger.log('Already exists: ' + name);
     }
   });
 }
@@ -197,59 +205,58 @@ function dryRunScan() {
   assertAdvancedGmailEnabled_();
 
   Logger.log('--- DRY RUN SCAN START ---');
-  Logger.log(`DRY_RUN = ${config.dryRun}`);
-  Logger.log(`MIN_EMAIL_DATE = ${config.minEmailDate}`);
-  Logger.log(`FETCH_REMOTE_IMAGES = ${config.fetchRemoteImages}`);
+  Logger.log('DRY_RUN = ' + config.dryRun);
+  Logger.log('MIN_EMAIL_DATE = ' + config.minEmailDate);
+  Logger.log('FETCH_REMOTE_IMAGES = ' + config.fetchRemoteImages);
+  Logger.log('RECEIPT_THRESHOLD = ' + config.receiptThreshold);
+  Logger.log('REVIEW_THRESHOLD = ' + config.reviewThreshold);
 
-  config.labels.forEach(labelName => {
+  config.labels.forEach(function (labelName) {
     const afterDate = getAfterQueryDate_(config.minEmailDate);
-    const query = `label:${labelName} -label:${config.processedLabel} after:${afterDate}`;
+    const query = 'label:' + labelName + ' after:' + afterDate;
     const threads = GmailApp.search(query, 0, 50);
 
-    Logger.log(`Label: ${labelName}`);
-    Logger.log(`Matching threads: ${threads.length}`);
+    Logger.log('Label: ' + labelName);
+    Logger.log('Matching threads: ' + threads.length);
 
-    threads.forEach(thread => {
-      const message = getTargetMessageFromThread_(thread);
+    threads.forEach(function (thread) {
+      const selection = inspectThreadForReceipt_(thread, config);
 
-      if (!message) {
-        Logger.log(`No usable message found in thread ${thread.getId()}`);
+      if (!selection) {
+        Logger.log('No eligible message found in thread ' + thread.getId());
         return;
       }
 
-      if (!isMessageOnOrAfterMinDate_(message, config.minEmailDate)) {
-        Logger.log(
-          `Skipping pre-${config.minEmailDate} message ${message.getId()} with date ${message.getDate().toISOString()}`
-        );
-        return;
-      }
-
-      const apiBundle = getApiMessageBundle_(message.getId());
-      const context = buildMessageContext_(
-        message,
-        labelName,
-        config,
-        apiBundle.parsed
-      );
+      const message = selection.message;
+      const apiBundle = selection.apiBundle;
+      const receiptCheck = selection.receiptCheck;
+      const context = buildMessageContext_(message, labelName, config, apiBundle.parsed);
       const receiptDedupKey = buildReceiptDedupKey_(context, apiBundle.parsed);
 
       const info = {
-        orderNumber: context.orderNumber,
         label: labelName,
         person: context.person,
-        messageId: message.getId(),
         threadId: thread.getId(),
+        messageId: message.getId(),
+        decision: selection.decision,
+        score: receiptCheck.score,
+        reasons: receiptCheck.reasons,
         from: message.getFrom(),
         subject: message.getSubject(),
         date: message.getDate().toISOString(),
+        orderNumber: context.orderNumber,
+        vendorGuess: context.vendor,
+        receiptDedupKey: receiptDedupKey,
+        alreadyProcessedMessage: isMessageAlreadyProcessed_(message.getId()),
+        alreadyReviewedMessage: isMessageReviewed_(message.getId()),
+        alreadyIgnoredMessage: isMessageIgnoredNonReceipt_(message.getId()),
+        duplicateReceiptKey: isReceiptAlreadyProcessed_(receiptDedupKey),
         htmlLength: apiBundle.parsed.htmlBody.length,
         plainLength: apiBundle.parsed.plainBody.length,
         inlineImagesEmbedded: apiBundle.parsed.inlineImages.length,
         regularAttachments: apiBundle.parsed.regularAttachments.length,
-        vendorGuess: context.vendor,
-        receiptDedupKey,
-        duplicateReceiptKey: isReceiptAlreadyProcessed_(receiptDedupKey),
-        actions: buildPlannedActions_(config, apiBundle.parsed)
+        inspectedMessages: selection.inspectedMessages,
+        actions: buildPlannedActions_(config, apiBundle.parsed, selection.decision)
       };
 
       Logger.log(JSON.stringify(info));
@@ -259,15 +266,23 @@ function dryRunScan() {
   Logger.log('--- DRY RUN SCAN END ---');
 }
 
-function buildPlannedActions_(config, parsed) {
+function buildPlannedActions_(config, parsed, decision) {
   const actions = [];
 
-  if (config.savePdf) actions.push('save-pdf');
-  if (config.saveAttachments && parsed.regularAttachments.length > 0) {
-    actions.push('save-attachments');
-  }
-  if (config.fetchRemoteImages) {
-    actions.push('best-effort-inline-remote-images');
+  if (decision === 'process') {
+    if (config.savePdf) actions.push('save-pdf');
+    if (config.saveAttachments && parsed.regularAttachments.length > 0) {
+      actions.push('save-attachments');
+    }
+    if (config.fetchRemoteImages) {
+      actions.push('best-effort-inline-remote-images');
+    }
+    actions.push('mark-processed');
+  } else if (decision === 'review') {
+    actions.push('route-to-review');
+    actions.push('apply-review-label');
+  } else if (decision === 'ignore') {
+    actions.push('apply-ignored-nonreceipt-label');
   }
 
   actions.push('full-email-png-not-supported-in-apps-script-only');
@@ -288,17 +303,21 @@ function runReceiptIngestion() {
     runId: new Date().toISOString(),
     dryRun: config.dryRun,
     scannedThreads: 0,
-    scannedMessages: 0,
+    inspectedMessages: 0,
     processed: 0,
+    reviewed: 0,
+    ignoredNonReceipt: 0,
     skipped: 0,
+    skippedNoEligibleMessage: 0,
     skippedDuplicateMessage: 0,
     skippedDuplicateReceipt: 0,
+    skippedAlreadyReviewed: 0,
+    skippedAlreadyIgnored: 0,
     failed: 0,
     needsReview: 0,
     savedFiles: 0,
     savedHtml: 0,
     savedPdf: 0,
-    savedRawEmail: 0,
     savedManifest: 0,
     savedAttachments: 0,
     savedInlineImages: 0,
@@ -311,7 +330,7 @@ function runReceiptIngestion() {
     Logger.log('--- RECEIPT INGESTION START ---');
     Logger.log(JSON.stringify(summary));
 
-    config.labels.forEach(labelName => {
+    config.labels.forEach(function (labelName) {
       processLabel_(labelName, config, summary);
     });
 
@@ -326,120 +345,372 @@ function runReceiptIngestion() {
 
 function processLabel_(labelName, config, summary) {
   const afterDate = getAfterQueryDate_(config.minEmailDate);
-  const query = `label:${labelName} -label:${config.processedLabel} after:${afterDate}`;
+  const query = 'label:' + labelName + ' after:' + afterDate;
   const threads = GmailApp.search(query, 0, 100);
 
   Logger.log(
-    `Processing label ${labelName} with ${threads.length} matching threads from ${config.minEmailDate} onward`
+    'Processing label ' +
+      labelName +
+      ' with ' +
+      threads.length +
+      ' matching threads from ' +
+      config.minEmailDate +
+      ' onward'
   );
 
-  threads.forEach(thread => {
+  threads.forEach(function (thread) {
     summary.scannedThreads += 1;
 
-    const message = getTargetMessageFromThread_(thread);
-    if (!message) {
+    const selection = inspectThreadForReceipt_(thread, config);
+    if (!selection) {
+      Logger.log('Skipping thread ' + thread.getId() + ' because no eligible message was found');
       summary.skipped += 1;
+      summary.skippedNoEligibleMessage += 1;
       return;
     }
 
-    if (!isMessageOnOrAfterMinDate_(message, config.minEmailDate)) {
-      Logger.log(
-        `Skipping pre-${config.minEmailDate} message ${message.getId()} with date ${message.getDate().toISOString()}`
-      );
-      summary.skipped += 1;
-      return;
-    }
+    summary.inspectedMessages += selection.inspectedMessages;
 
-    summary.scannedMessages += 1;
+    const message = selection.message;
+    const apiBundle = selection.apiBundle;
+    const receiptCheck = selection.receiptCheck;
     const messageId = message.getId();
 
-    if (isMessageAlreadyProcessed_(messageId)) {
-      Logger.log(`Skipping already-processed message ID ${messageId}`);
-      summary.skipped += 1;
-      summary.skippedDuplicateMessage += 1;
+    Logger.log(
+      'Selected message ' +
+        messageId +
+        ' from thread ' +
+        thread.getId() +
+        ' with decision=' +
+        selection.decision +
+        ' score=' +
+        receiptCheck.score
+    );
+
+    if (selection.decision === 'process') {
+      if (isMessageAlreadyProcessed_(messageId)) {
+        Logger.log('Skipping already-processed message ID ' + messageId);
+        summary.skipped += 1;
+        summary.skippedDuplicateMessage += 1;
+        return;
+      }
+
+      try {
+        const context = buildMessageContext_(message, labelName, config, apiBundle.parsed);
+        const receiptDedupKey = buildReceiptDedupKey_(context, apiBundle.parsed);
+        context.receiptDedupKey = receiptDedupKey;
+
+        if (isReceiptAlreadyProcessed_(receiptDedupKey)) {
+          Logger.log('Skipping duplicate receipt key ' + receiptDedupKey + ' for message ' + messageId);
+          if (!config.dryRun) {
+            markProcessed_(thread, messageId, receiptDedupKey, config, true);
+          }
+          summary.skipped += 1;
+          summary.skippedDuplicateReceipt += 1;
+          return;
+        }
+
+        if (config.dryRun) {
+          Logger.log('[DRY RUN] Would process ' + messageId + ' for ' + context.person);
+          summary.processed += 1;
+          return;
+        }
+
+        const saveResult = saveEmailPackage_(message, apiBundle, context, config);
+
+        markProcessed_(thread, messageId, receiptDedupKey, config);
+
+        summary.processed += 1;
+        summary.savedFiles += saveResult.savedFiles;
+        summary.savedHtml += saveResult.savedHtml;
+        summary.savedPdf += saveResult.savedPdf;
+        summary.savedManifest += saveResult.savedManifest;
+        summary.savedAttachments += saveResult.savedAttachments;
+        summary.savedInlineImages += saveResult.savedInlineImages;
+        summary.pngSkipped += 1;
+      } catch (err) {
+        Logger.log('FAILED for message ' + messageId + ': ' + err.message);
+
+        routeToNeedsReview_(message, labelName, err, config, receiptCheck);
+        addReviewLabel_(thread, config);
+        markMessageReviewed_(messageId);
+
+        summary.failed += 1;
+        summary.needsReview += 1;
+      }
+
       return;
     }
 
-    try {
-      const apiBundle = getApiMessageBundle_(messageId);
-      const context = buildMessageContext_(
-        message,
-        labelName,
-        config,
-        apiBundle.parsed
-      );
-      const receiptDedupKey = buildReceiptDedupKey_(context, apiBundle.parsed);
-      context.receiptDedupKey = receiptDedupKey;
-
-      if (isReceiptAlreadyProcessed_(receiptDedupKey)) {
-        Logger.log(`Skipping duplicate receipt key ${receiptDedupKey} for message ${messageId}`);
-        markProcessed_(thread, messageId, receiptDedupKey, config, true);
+    if (selection.decision === 'review') {
+      if (isMessageReviewed_(messageId)) {
+        Logger.log('Skipping already-reviewed borderline message ID ' + messageId);
         summary.skipped += 1;
-        summary.skippedDuplicateReceipt += 1;
+        summary.skippedAlreadyReviewed += 1;
         return;
       }
 
       if (config.dryRun) {
-        Logger.log(`[DRY RUN] Would process ${messageId} for ${context.person}`);
-        summary.processed += 1;
+        Logger.log('[DRY RUN] Would send message ' + messageId + ' to review');
+        summary.reviewed += 1;
+        summary.needsReview += 1;
         return;
       }
 
-      const saveResult = saveEmailPackage_(message, apiBundle, context, config);
-
-      markProcessed_(thread, messageId, receiptDedupKey, config);
-
-      summary.processed += 1;
-      summary.savedFiles += saveResult.savedFiles;
-      summary.savedHtml += saveResult.savedHtml;
-      summary.savedPdf += saveResult.savedPdf;
-      summary.savedRawEmail += saveResult.savedRawEmail;
-      summary.savedManifest += saveResult.savedManifest;
-      summary.savedAttachments += saveResult.savedAttachments;
-      summary.savedInlineImages += saveResult.savedInlineImages;
-      summary.pngSkipped += 1;
-    } catch (err) {
-      Logger.log(`FAILED for message ${messageId}: ${err.message}`);
-
-      routeToNeedsReview_(message, labelName, err, config);
+      routeToNeedsReview_(
+        message,
+        labelName,
+        new Error('Borderline receipt classification'),
+        config,
+        receiptCheck
+      );
       addReviewLabel_(thread, config);
+      markMessageReviewed_(messageId);
 
-      summary.failed += 1;
+      summary.reviewed += 1;
       summary.needsReview += 1;
+      return;
     }
+
+    if (isMessageIgnoredNonReceipt_(messageId)) {
+      Logger.log('Skipping already-ignored non-receipt message ID ' + messageId);
+      summary.skipped += 1;
+      summary.skippedAlreadyIgnored += 1;
+      return;
+    }
+
+    if (config.dryRun) {
+      Logger.log('[DRY RUN] Would ignore non-receipt message ' + messageId);
+      summary.ignoredNonReceipt += 1;
+      return;
+    }
+
+    addIgnoredLabel_(thread, config);
+    markMessageIgnoredNonReceipt_(messageId);
+    summary.ignoredNonReceipt += 1;
   });
 }
 
-function getTargetMessageFromThread_(thread) {
+/* =========================
+ * RECEIPT CLASSIFICATION
+ * ========================= */
+
+function inspectThreadForReceipt_(thread, config) {
   const messages = thread.getMessages();
-  if (!messages || messages.length === 0) return null;
-  return messages[messages.length - 1];
+  let inspectedCount = 0;
+  let bestReview = null;
+  let bestIgnore = null;
+
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const message = messages[i];
+
+    if (!isMessageOnOrAfterMinDate_(message, config.minEmailDate)) {
+      continue;
+    }
+
+    inspectedCount += 1;
+
+    const apiBundle = getApiMessageBundle_(message.getId());
+    const receiptCheck = classifyReceiptMessage_(message, apiBundle.parsed, config);
+
+    const candidate = {
+      decision: receiptCheck.decision,
+      message: message,
+      apiBundle: apiBundle,
+      receiptCheck: receiptCheck,
+      inspectedMessages: inspectedCount
+    };
+
+    if (receiptCheck.decision === 'process') {
+      return candidate;
+    }
+
+    if (receiptCheck.decision === 'review' && !bestReview) {
+      bestReview = candidate;
+      continue;
+    }
+
+    if (receiptCheck.decision === 'ignore' && !bestIgnore) {
+      bestIgnore = candidate;
+    }
+  }
+
+  if (bestReview) {
+    bestReview.inspectedMessages = inspectedCount;
+    return bestReview;
+  }
+
+  if (bestIgnore) {
+    bestIgnore.inspectedMessages = inspectedCount;
+    return bestIgnore;
+  }
+
+  return null;
 }
 
-function buildMessageContext_(message, labelName, config, parsed) {
-  const receivedDate = message.getDate();
-  const person = mapLabelToPerson_(labelName);
-  const year = Utilities.formatDate(receivedDate, config.timezone, 'yyyy');
-  const month = Utilities.formatDate(receivedDate, config.timezone, 'yyyy-MM');
+function classifyReceiptMessage_(message, parsed, config) {
+  const subject = stripReplyForwardPrefixes_(message.getSubject() || '');
+  const from = String(message.getFrom() || '');
+  const plainBody = String(parsed.plainBody || '');
+  const htmlText = htmlToPlainText_(parsed.htmlBody || '');
+  const attachmentNames = (parsed.regularAttachments || [])
+    .map(function (att) { return String(att.filename || ''); })
+    .join(' ');
 
-  const vendor = detectVendor_(message, parsed);
-  const orderNumber = extractOrderNumber_(message, parsed);
+  const combined = [subject, from, plainBody, htmlText, attachmentNames].join('\n');
+  const combinedLower = combined.toLowerCase();
+
+  let score = 0;
+  const reasons = [];
+
+  const strongPositivePatterns = [
+    /\breceipt\b/i,
+    /\binvoice\b/i,
+    /\border confirmation\b/i,
+    /\bpayment received\b/i,
+    /\bbooking confirmation\b/i,
+    /\bitinerary\b/i,
+    /\btrip receipt\b/i,
+    /\byour order\b/i,
+    /\bthank you for your order\b/i,
+    /\border number\b/i,
+    /\binvoice number\b/i,
+    /\btransaction id\b/i,
+    /\bconfirmation number\b/i,
+    /\bpayment summary\b/i,
+    /\bcharged\b/i,
+    /\bamount paid\b/i
+  ];
+
+  strongPositivePatterns.forEach(function (pattern) {
+    if (pattern.test(combined)) {
+      score += 2;
+      reasons.push('positive:' + pattern);
+    }
+  });
+
+  const attachments = parsed.regularAttachments || [];
+  if (attachments.length > 0) {
+    score += 2;
+    reasons.push('has-attachment');
+  }
+
+  const hasPdf = attachments.some(function (att) {
+    const mimeType = String(att.mimeType || '').toLowerCase();
+    const filename = String(att.filename || '');
+    return mimeType.indexOf('pdf') > -1 || /\.pdf$/i.test(filename);
+  });
+  if (hasPdf) {
+    score += 2;
+    reasons.push('has-pdf');
+  }
+
+  const weakPositivePatterns = [
+    /\border\b/i,
+    /\bconfirmation\b/i,
+    /\btotal\b/i,
+    /\bsubtotal\b/i,
+    /\btax\b/i,
+    /\bbilling\b/i,
+    /\bamount\b/i,
+    /\bpayment\b/i,
+    /\bmerchant\b/i,
+    /\bvisa\b/i,
+    /\bmastercard\b/i,
+    /\bcard ending\b/i,
+    /\blast 4\b/i
+  ];
+
+  weakPositivePatterns.forEach(function (pattern) {
+    if (pattern.test(combined)) {
+      score += 1;
+      reasons.push('weak-positive:' + pattern);
+    }
+  });
+
+  if (containsCurrencyAmount_(combinedLower)) {
+    score += 1;
+    reasons.push('currency-amount');
+  }
+
+  const negativePatterns = [
+    /\bunsubscribe\b/i,
+    /\bmanage preferences\b/i,
+    /\bview in browser\b/i,
+    /\bshop now\b/i,
+    /\bbuy now\b/i,
+    /\blimited time\b/i,
+    /\bsale\b/i,
+    /\bpromo\b/i,
+    /\bpromotion\b/i,
+    /\bnewsletter\b/i,
+    /\bnew arrivals\b/i,
+    /\btrending\b/i,
+    /\bfollow us\b/i,
+    /\bon instagram\b/i,
+    /\bon facebook\b/i,
+    /\bon tiktok\b/i,
+    /\byou may also like\b/i,
+    /\brecommended for you\b/i,
+    /\bflash sale\b/i,
+    /\bexclusive offer\b/i,
+    /\buse code\b/i,
+    /\bdiscount code\b/i
+  ];
+
+  negativePatterns.forEach(function (pattern) {
+    if (pattern.test(combined)) {
+      score -= 2;
+      reasons.push('negative:' + pattern);
+    }
+  });
+
+  const shippingOnlyPatterns = [
+    /\bshipped\b/i,
+    /\bout for delivery\b/i,
+    /\btracking number\b/i,
+    /\btrack your package\b/i,
+    /\bdelivery update\b/i,
+    /\bshipment\b/i,
+    /\bestimated delivery\b/i
+  ];
+
+  let shippingHits = 0;
+  shippingOnlyPatterns.forEach(function (pattern) {
+    if (pattern.test(combined)) {
+      shippingHits += 1;
+    }
+  });
+
+  if (shippingHits > 0) {
+    score -= 1;
+    reasons.push('shipping-language');
+  }
+
+  const rawSubject = String(message.getSubject() || '').trim();
+  if (/^fwd?:/i.test(rawSubject) || /^re:/i.test(rawSubject)) {
+    score -= 1;
+    reasons.push('reply-or-forward');
+  }
+
+  const decision =
+    score >= config.receiptThreshold
+      ? 'process'
+      : score >= config.reviewThreshold
+      ? 'review'
+      : 'ignore';
 
   return {
-    messageId: message.getId(),
-    threadId: message.getThread().getId(),
-    labelName,
-    person,
-    from: message.getFrom(),
-    subject: message.getSubject(),
-    receivedAtIso: receivedDate.toISOString(),
-    year,
-    month,
-    vendor: vendor || 'UnknownVendor',
-    orderNumber: orderNumber || '',
-    shortId: message.getId().slice(-8),
-    datePart: Utilities.formatDate(receivedDate, config.timezone, 'ddMMM')
+    isReceipt: decision === 'process',
+    decision: decision,
+    score: score,
+    reasons: reasons
   };
+}
+
+function containsCurrencyAmount_(text) {
+  const value = String(text || '');
+  return /(\$\s?\d[\d,]*(?:\.\d{2})?)|(usd\s?\d[\d,]*(?:\.\d{2})?)/i.test(value);
 }
 
 /* =========================
@@ -448,13 +719,11 @@ function buildMessageContext_(message, labelName, config, parsed) {
 
 function getApiMessageBundle_(messageId) {
   const fullMessage = Gmail.Users.Messages.get('me', messageId, { format: 'full' });
-  const rawMessage = Gmail.Users.Messages.get('me', messageId, { format: 'raw' });
   const parsed = parseApiMessage_(fullMessage);
 
   return {
-    fullMessage,
-    rawMessage,
-    parsed
+    fullMessage: fullMessage,
+    parsed: parsed
   };
 }
 
@@ -481,8 +750,8 @@ function parseApiMessage_(apiMessage) {
   htmlBody = inlineCidImages_(htmlBody, state.inlineImages);
 
   return {
-    htmlBody,
-    plainBody,
+    htmlBody: htmlBody,
+    plainBody: plainBody,
     inlineImages: state.inlineImages,
     regularAttachments: state.regularAttachments,
     headers: state.topHeaders
@@ -502,7 +771,9 @@ function walkMimePart_(part, messageId, state) {
   const hasBodyData = part.body && (part.body.data || part.body.attachmentId);
 
   if (hasChildParts) {
-    part.parts.forEach(child => walkMimePart_(child, messageId, state));
+    part.parts.forEach(function (child) {
+      walkMimePart_(child, messageId, state);
+    });
   }
 
   if (!hasBodyData) return;
@@ -511,7 +782,7 @@ function walkMimePart_(part, messageId, state) {
     const html = getDecodedPartString_(messageId, part);
     if (html) {
       state.htmlCandidates.push({
-        mimeType,
+        mimeType: mimeType,
         content: stripScriptsOnly_(html)
       });
     }
@@ -522,7 +793,7 @@ function walkMimePart_(part, messageId, state) {
     const text = getDecodedPartString_(messageId, part);
     if (text) {
       state.plainCandidates.push({
-        mimeType,
+        mimeType: mimeType,
         content: text
       });
     }
@@ -533,12 +804,15 @@ function walkMimePart_(part, messageId, state) {
     const bytes = getPartBytes_(messageId, part);
     if (bytes.length > 0) {
       state.inlineImages.push({
-        contentId,
+        contentId: contentId,
         filename:
           filename ||
-          `inline-${part.partId || 'image'}.${guessExtensionFromMime_(mimeType) || 'bin'}`,
-        mimeType,
-        bytes,
+          'inline-' +
+            (part.partId || 'image') +
+            '.' +
+            (guessExtensionFromMime_(mimeType) || 'bin'),
+        mimeType: mimeType,
+        bytes: bytes,
         dataUri: buildDataUri_(mimeType, bytes)
       });
     }
@@ -551,7 +825,7 @@ function walkMimePart_(part, messageId, state) {
       state.regularAttachments.push({
         filename: filename || buildFallbackAttachmentName_(part),
         mimeType: mimeType || 'application/octet-stream',
-        bytes
+        bytes: bytes
       });
     }
   }
@@ -582,7 +856,10 @@ function getDecodedPartString_(messageId, part) {
       return Utilities.newBlob(bytes).getDataAsString();
     } catch (err2) {
       Logger.log(
-        `WARN getDecodedPartString_ failed for message ${messageId}, part ${part.partId || 'unknown'}`
+        'WARN getDecodedPartString_ failed for message ' +
+          messageId +
+          ', part ' +
+          (part.partId || 'unknown')
       );
       return '';
     }
@@ -598,18 +875,19 @@ function getPartBytes_(messageId, part) {
     }
 
     if (part.body.attachmentId) {
-      const body = Gmail.Users.Messages.Attachments.get(
-        'me',
-        messageId,
-        part.body.attachmentId
-      );
+      const body = Gmail.Users.Messages.Attachments.get('me', messageId, part.body.attachmentId);
       return decodeBase64UrlToBytes_(body.data || '');
     }
 
     return [];
   } catch (err) {
     Logger.log(
-      `WARN getPartBytes_ failed for message ${messageId}, part ${part.partId || 'unknown'}: ${err.message}`
+      'WARN getPartBytes_ failed for message ' +
+        messageId +
+        ', part ' +
+        (part.partId || 'unknown') +
+        ': ' +
+        err.message
     );
     return [];
   }
@@ -625,7 +903,6 @@ function saveEmailPackage_(message, apiBundle, context, config) {
     savedFiles: 0,
     savedHtml: 0,
     savedPdf: 0,
-    savedRawEmail: 0,
     savedManifest: 0,
     savedAttachments: 0,
     savedInlineImages: 0
@@ -637,18 +914,20 @@ function saveEmailPackage_(message, apiBundle, context, config) {
     const htmlBlobForPdf = Utilities.newBlob(
       renderHtml,
       'text/html',
-      `${context.datePart}-${context.vendor}-${context.shortId}-email-body.html`
+      context.datePart + '-' + context.vendor + '-' + context.shortId + '-email-body.html'
     );
 
     const pdfFilename = buildEmailBodyPdfFilename_(context);
     const pdfBlob = htmlBlobForPdf.getAs('application/pdf').setName(pdfFilename);
     const pdfFile = folder.createFile(pdfBlob).setName(pdfFilename);
 
-    addFileDescription_(pdfFile, {
-      ...context,
-      artifactType: 'email-body-pdf',
-      status: 'success'
-    });
+    addFileDescription_(
+      pdfFile,
+      mergeObjects_(context, {
+        artifactType: 'email-body-pdf',
+        status: 'success'
+      })
+    );
 
     result.savedFiles += 1;
     result.savedPdf += 1;
@@ -657,7 +936,7 @@ function saveEmailPackage_(message, apiBundle, context, config) {
   if (config.saveAttachments && apiBundle.parsed.regularAttachments.length > 0) {
     const attachFolder = getOrCreateChildFolder_(folder, '_attachments');
 
-    apiBundle.parsed.regularAttachments.forEach(att => {
+    apiBundle.parsed.regularAttachments.forEach(function (att) {
       const safeName = buildAttachmentOutputName_(context, att);
 
       const blob = Utilities.newBlob(
@@ -668,13 +947,15 @@ function saveEmailPackage_(message, apiBundle, context, config) {
 
       const file = attachFolder.createFile(blob).setName(safeName);
 
-      addFileDescription_(file, {
-        ...context,
-        artifactType: 'attachment',
-        originalAttachmentName: att.filename,
-        contentType: att.mimeType,
-        status: 'success'
-      });
+      addFileDescription_(
+        file,
+        mergeObjects_(context, {
+          artifactType: 'attachment',
+          originalAttachmentName: att.filename,
+          contentType: att.mimeType,
+          status: 'success'
+        })
+      );
 
       result.savedFiles += 1;
       result.savedAttachments += 1;
@@ -692,7 +973,7 @@ function buildRenderableEmailHtml_(message, parsed, config) {
   }
 
   if (!html || !html.trim()) {
-    html = `<pre>${escapeHtml_(parsed.plainBody || message.getPlainBody() || '')}</pre>`;
+    html = '<pre>' + escapeHtml_(parsed.plainBody || message.getPlainBody() || '') + '</pre>';
   }
 
   html = inlineCidImages_(html, parsed.inlineImages);
@@ -702,6 +983,11 @@ function buildRenderableEmailHtml_(message, parsed, config) {
   }
 
   return ensureHtmlDocument_(html, message.getSubject() || '(no subject)');
+}
+
+function buildEmailBodyPdfFilename_(context) {
+  const ref = context.orderNumber || context.shortId;
+  return context.datePart + '-' + context.vendor + '-' + ref + '-email-body.pdf';
 }
 
 function normalizeFetchableUrl_(url) {
@@ -730,22 +1016,22 @@ function inlineRemoteImagesAsDataUris_(html) {
   const replacements = fetchImageDataUris_(urls);
 
   value = value.replace(
-    /src=(["'])(https?:\/\/[^"']+|\/\/[^"']+)\1/gi,
+    /src=(['"])(https?:\/\/[^'"]+|\/\/[^'"]+)\1/gi,
     function (match, quote, url) {
       const normalized = normalizeFetchableUrl_(url);
       if (replacements[normalized]) {
-        return `src=${quote}${replacements[normalized]}${quote}`;
+        return 'src=' + quote + replacements[normalized] + quote;
       }
       return match;
     }
   );
 
   value = value.replace(
-    /url\((["']?)(https?:\/\/[^"'()]+|\/\/[^"'()]+)\1\)/gi,
+    /url\((['"]?)(https?:\/\/[^'"()]+|\/\/[^'"()]+)\1\)/gi,
     function (match, quote, url) {
       const normalized = normalizeFetchableUrl_(url);
       if (replacements[normalized]) {
-        return `url(${quote}${replacements[normalized]}${quote})`;
+        return 'url(' + quote + replacements[normalized] + quote + ')';
       }
       return match;
     }
@@ -773,7 +1059,7 @@ function collectRemoteImageUrls_(html) {
   }
 
   html.replace(
-    /<img[^>]+src=(["'])(https?:\/\/[^"']+|\/\/[^"']+)\1/gi,
+    /<img[^>]+src=(['"])(https?:\/\/[^'"]+|\/\/[^'"]+)\1/gi,
     function (_match, _quote, url) {
       addUrl(url);
       return _match;
@@ -781,7 +1067,7 @@ function collectRemoteImageUrls_(html) {
   );
 
   html.replace(
-    /url\((["']?)(https?:\/\/[^"'()]+|\/\/[^"'()]+)\1\)/gi,
+    /url\((['"]?)(https?:\/\/[^'"()]+|\/\/[^'"()]+)\1\)/gi,
     function (_match, _quote, url) {
       addUrl(url);
       return _match;
@@ -814,13 +1100,13 @@ function fetchImageDataUris_(urls) {
         followRedirects: true,
         headers: {
           'User-Agent': 'Mozilla/5.0',
-          'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8'
+          Accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8'
         }
       });
 
       const code = response.getResponseCode();
       if (code < 200 || code >= 300) {
-        Logger.log(`WARN image fetch failed ${code} for ${url}`);
+        Logger.log('WARN image fetch failed ' + code + ' for ' + url);
         continue;
       }
 
@@ -828,24 +1114,24 @@ function fetchImageDataUris_(urls) {
       const contentType = String(blob.getContentType() || '').toLowerCase();
 
       if (contentType.indexOf('image/') !== 0) {
-        Logger.log(`WARN non-image content for ${url}: ${contentType}`);
+        Logger.log('WARN non-image content for ' + url + ': ' + contentType);
         continue;
       }
 
       const bytes = blob.getBytes();
       if (!bytes || bytes.length === 0) {
-        Logger.log(`WARN empty image response for ${url}`);
+        Logger.log('WARN empty image response for ' + url);
         continue;
       }
 
       if (bytes.length > MAX_IMAGE_BYTES) {
-        Logger.log(`WARN oversized image skipped (${bytes.length} bytes) for ${url}`);
+        Logger.log('WARN oversized image skipped (' + bytes.length + ' bytes) for ' + url);
         continue;
       }
 
       map[url] = buildDataUri_(contentType, bytes);
     } catch (err) {
-      Logger.log(`WARN remote image fetch exception for ${url}: ${err.message}`);
+      Logger.log('WARN remote image fetch exception for ' + url + ': ' + err.message);
     }
   }
 
@@ -871,9 +1157,9 @@ function shouldFetchRemoteImageUrl_(url) {
   }
 
   if (
-    value.startsWith('data:') ||
-    value.startsWith('cid:') ||
-    value.startsWith('blob:')
+    value.indexOf('data:') === 0 ||
+    value.indexOf('cid:') === 0 ||
+    value.indexOf('blob:') === 0
   ) {
     return false;
   }
@@ -885,16 +1171,18 @@ function ensureHtmlDocument_(html, title) {
   let value = stripScriptsOnly_(String(html || '').trim());
 
   if (!value) {
-    return `
-<!DOCTYPE html>
-<html>
-  <head>
-    <meta charset="utf-8" />
-    <title>${escapeHtml_(title || '(no subject)')}</title>
-  </head>
-  <body></body>
-</html>
-    `.trim();
+    return (
+      '<!DOCTYPE html>\n' +
+      '<html>\n' +
+      '  <head>\n' +
+      '    <meta charset="utf-8" />\n' +
+      '    <title>' +
+      escapeHtml_(title || '(no subject)') +
+      '</title>\n' +
+      '  </head>\n' +
+      '  <body></body>\n' +
+      '</html>'
+    );
   }
 
   if (/<!doctype/i.test(value) || /<html[\s>]/i.test(value)) {
@@ -902,44 +1190,39 @@ function ensureHtmlDocument_(html, title) {
   }
 
   if (/<head[\s>]/i.test(value) || /<body[\s>]/i.test(value)) {
-    return `
-<!DOCTYPE html>
-<html>
-  <head>
-    <meta charset="utf-8" />
-    <title>${escapeHtml_(title || '(no subject)')}</title>
-  </head>
-  ${value}
-</html>
-    `.trim();
+    return (
+      '<!DOCTYPE html>\n' +
+      '<html>\n' +
+      '  <head>\n' +
+      '    <meta charset="utf-8" />\n' +
+      '    <title>' +
+      escapeHtml_(title || '(no subject)') +
+      '</title>\n' +
+      '  </head>\n' +
+      value +
+      '\n</html>'
+    );
   }
 
-  return `
-<!DOCTYPE html>
-<html>
-  <head>
-    <meta charset="utf-8" />
-    <title>${escapeHtml_(title || '(no subject)')}</title>
-    <style>
-      html, body {
-        margin: 0;
-        padding: 0;
-        background: #ffffff;
-      }
-      pre {
-        white-space: pre-wrap;
-        word-wrap: break-word;
-      }
-      * {
-        box-sizing: border-box;
-      }
-    </style>
-  </head>
-  <body>
-    ${value}
-  </body>
-</html>
-  `.trim();
+  return (
+    '<!DOCTYPE html>\n' +
+    '<html>\n' +
+    '  <head>\n' +
+    '    <meta charset="utf-8" />\n' +
+    '    <title>' +
+    escapeHtml_(title || '(no subject)') +
+    '</title>\n' +
+    '    <style>\n' +
+    '      html, body { margin: 0; padding: 0; background: #ffffff; }\n' +
+    '      pre { white-space: pre-wrap; word-wrap: break-word; }\n' +
+    '      * { box-sizing: border-box; }\n' +
+    '    </style>\n' +
+    '  </head>\n' +
+    '  <body>\n' +
+    value +
+    '\n  </body>\n' +
+    '</html>'
+  );
 }
 
 function stripScriptsOnly_(html) {
@@ -951,24 +1234,24 @@ function inlineCidImages_(html, inlineImages) {
   if (!value || !inlineImages || inlineImages.length === 0) return value;
 
   const map = {};
-  inlineImages.forEach(img => {
+  inlineImages.forEach(function (img) {
     if (img.contentId) {
       map[img.contentId.toLowerCase()] = img.dataUri;
     }
   });
 
-  value = value.replace(/src=(["'])cid:([^"']+)\1/gi, function (match, quote, cid) {
+  value = value.replace(/src=(['"])cid:([^'"]+)\1/gi, function (match, quote, cid) {
     const normalized = normalizeContentId_(cid).toLowerCase();
     if (map[normalized]) {
-      return `src=${quote}${map[normalized]}${quote}`;
+      return 'src=' + quote + map[normalized] + quote;
     }
     return match;
   });
 
-  value = value.replace(/url\((["']?)cid:([^"')]+)\1\)/gi, function (match, quote, cid) {
+  value = value.replace(/url\((['"]?)cid:([^"')]+)\1\)/gi, function (match, _quote, cid) {
     const normalized = normalizeContentId_(cid).toLowerCase();
     if (map[normalized]) {
-      return `url(${map[normalized]})`;
+      return 'url(' + map[normalized] + ')';
     }
     return match;
   });
@@ -978,7 +1261,7 @@ function inlineCidImages_(html, inlineImages) {
 
 function headersArrayToMap_(headers) {
   const map = {};
-  (headers || []).forEach(header => {
+  (headers || []).forEach(function (header) {
     map[String(header.name || '').toLowerCase()] = String(header.value || '');
   });
   return map;
@@ -1007,7 +1290,7 @@ function decodeBase64UrlToBytes_(data) {
         for (let i = 0; i < data.length; i += 1) {
           arr.push(Number(data[i]));
         }
-        if (arr.length > 0 && arr.every(n => !isNaN(n))) {
+        if (arr.length > 0 && arr.every(function (n) { return !isNaN(n); })) {
           return arr;
         }
       }
@@ -1022,7 +1305,7 @@ function decodeBase64UrlToBytes_(data) {
   }
 
   if (/^\d+(,\d+)+$/.test(rawString)) {
-    return rawString.split(',').map(n => Number(n));
+    return rawString.split(',').map(function (n) { return Number(n); });
   }
 
   const cleaned = rawString.replace(/\s+/g, '');
@@ -1038,7 +1321,7 @@ function decodeBase64UrlToBytes_(data) {
     try {
       return Utilities.base64Decode(fallback);
     } catch (err2) {
-      throw new Error(`Could not decode binary field. Prefix=${rawString.slice(0, 60)}...`);
+      throw new Error('Could not decode binary field. Prefix=' + rawString.slice(0, 60) + '...');
     }
   }
 }
@@ -1046,7 +1329,7 @@ function decodeBase64UrlToBytes_(data) {
 function buildDataUri_(mimeType, bytes) {
   if (!bytes || bytes.length === 0) return '';
   const base64 = Utilities.base64Encode(bytes);
-  return `data:${mimeType};base64,${base64}`;
+  return 'data:' + mimeType + ';base64,' + base64;
 }
 
 function normalizeContentId_(contentId) {
@@ -1063,7 +1346,7 @@ function isLikelyAttachmentMime_(mimeType) {
 
 function buildFallbackAttachmentName_(part) {
   const ext = guessExtensionFromMime_(part.mimeType || '') || 'bin';
-  return `part-${part.partId || 'attachment'}.${ext}`;
+  return 'part-' + (part.partId || 'attachment') + '.' + ext;
 }
 
 function guessExtensionFromMime_(mime) {
@@ -1149,12 +1432,12 @@ function findChildFolderByName_(parent, name) {
 function writeRunLog_(summary, config) {
   const logsFolder = getLogsFolder_(config);
   const timestamp = Utilities.formatDate(new Date(), config.timezone, 'yyyy-MM-dd_HH-mm-ss');
-  const filename = `${timestamp}_run-log.json`;
+  const filename = timestamp + '_run-log.json';
 
   logsFolder.createFile(filename, JSON.stringify(summary, null, 2), MimeType.PLAIN_TEXT);
 }
 
-function routeToNeedsReview_(message, labelName, err, config) {
+function routeToNeedsReview_(message, labelName, err, config, receiptCheck) {
   const person = mapLabelToPerson_(labelName);
   const reviewFolder = getNeedsReviewFolder_(person, config);
   const now = new Date();
@@ -1167,14 +1450,17 @@ function routeToNeedsReview_(message, labelName, err, config) {
   ].join('_');
 
   const contents = [
-    `Person: ${person}`,
-    `Label: ${labelName}`,
-    `Message ID: ${message.getId()}`,
-    `Thread ID: ${message.getThread().getId()}`,
-    `From: ${message.getFrom()}`,
-    `Subject: ${message.getSubject()}`,
-    `Received: ${message.getDate().toISOString()}`,
-    `Error: ${err.message}`,
+    'Person: ' + person,
+    'Label: ' + labelName,
+    'Message ID: ' + message.getId(),
+    'Thread ID: ' + message.getThread().getId(),
+    'From: ' + message.getFrom(),
+    'Subject: ' + message.getSubject(),
+    'Received: ' + message.getDate().toISOString(),
+    'Error: ' + err.message,
+    'Classifier decision: ' + (receiptCheck ? receiptCheck.decision : ''),
+    'Classifier score: ' + (receiptCheck ? receiptCheck.score : ''),
+    'Classifier reasons: ' + (receiptCheck ? receiptCheck.reasons.join(' | ') : ''),
     '',
     'Plain body preview:',
     '------------------',
@@ -1189,7 +1475,7 @@ function addFileDescription_(file, metadata) {
 }
 
 /* =========================
- * PROCESSED STATE
+ * PROCESSED / REVIEW / IGNORED STATE
  * ========================= */
 
 function markProcessed_(thread, messageId, receiptDedupKey, config, skipReceiptMark) {
@@ -1207,6 +1493,11 @@ function addReviewLabel_(thread, config) {
   thread.addLabel(reviewLabel);
 }
 
+function addIgnoredLabel_(thread, config) {
+  const ignoredLabel = getOrCreateLabel_(config.ignoredLabel);
+  thread.addLabel(ignoredLabel);
+}
+
 function isMessageAlreadyProcessed_(messageId) {
   const map = readJsonPropertyObject_('PROCESSED_MESSAGE_IDS');
   return Boolean(map[messageId]);
@@ -1216,6 +1507,28 @@ function markMessageProcessed_(messageId) {
   const map = readJsonPropertyObject_('PROCESSED_MESSAGE_IDS');
   map[messageId] = new Date().toISOString();
   writeJsonPropertyObject_('PROCESSED_MESSAGE_IDS', map);
+}
+
+function isMessageReviewed_(messageId) {
+  const map = readJsonPropertyObject_('REVIEWED_MESSAGE_IDS');
+  return Boolean(map[messageId]);
+}
+
+function markMessageReviewed_(messageId) {
+  const map = readJsonPropertyObject_('REVIEWED_MESSAGE_IDS');
+  map[messageId] = new Date().toISOString();
+  writeJsonPropertyObject_('REVIEWED_MESSAGE_IDS', map);
+}
+
+function isMessageIgnoredNonReceipt_(messageId) {
+  const map = readJsonPropertyObject_('IGNORED_NON_RECEIPT_MESSAGE_IDS');
+  return Boolean(map[messageId]);
+}
+
+function markMessageIgnoredNonReceipt_(messageId) {
+  const map = readJsonPropertyObject_('IGNORED_NON_RECEIPT_MESSAGE_IDS');
+  map[messageId] = new Date().toISOString();
+  writeJsonPropertyObject_('IGNORED_NON_RECEIPT_MESSAGE_IDS', map);
 }
 
 function isReceiptAlreadyProcessed_(receiptDedupKey) {
@@ -1239,16 +1552,13 @@ function readJsonPropertyObject_(key) {
     const parsed = JSON.parse(raw);
     return parsed && typeof parsed === 'object' ? parsed : {};
   } catch (err) {
-    Logger.log(`WARN invalid JSON in Script Property ${key}. Resetting to empty object.`);
+    Logger.log('WARN invalid JSON in Script Property ' + key + '. Resetting to empty object.');
     return {};
   }
 }
 
 function writeJsonPropertyObject_(key, value) {
-  PropertiesService.getScriptProperties().setProperty(
-    key,
-    JSON.stringify(value || {})
-  );
+  PropertiesService.getScriptProperties().setProperty(key, JSON.stringify(value || {}));
 }
 
 function buildReceiptDedupKey_(context, parsed) {
@@ -1257,11 +1567,11 @@ function buildReceiptDedupKey_(context, parsed) {
   const orderNumber = sanitizeKeyPart_(context.orderNumber || '');
 
   if (orderNumber) {
-    return `v2|${person}|${vendor}|order|${orderNumber}`.toLowerCase();
+    return ('v2|' + person + '|' + vendor + '|order|' + orderNumber).toLowerCase();
   }
 
   const attachmentNames = (parsed.regularAttachments || [])
-    .map(att => sanitizeKeyPart_(att.filename || ''))
+    .map(function (att) { return sanitizeKeyPart_(att.filename || ''); })
     .filter(Boolean)
     .sort()
     .join('|');
@@ -1279,7 +1589,14 @@ function buildReceiptDedupKey_(context, parsed) {
     bodyText
   ].join('|');
 
-  return `v2|${person}|${vendor}|hash|${computeDigestHex_(source).slice(0, 32)}`.toLowerCase();
+  return (
+    'v2|' +
+    person +
+    '|' +
+    vendor +
+    '|hash|' +
+    computeDigestHex_(source).slice(0, 32)
+  ).toLowerCase();
 }
 
 function sanitizeKeyPart_(value) {
@@ -1315,8 +1632,34 @@ function computeDigestHex_(value) {
 }
 
 /* =========================
- * VENDOR HELPERS
+ * MESSAGE CONTEXT / VENDOR HELPERS
  * ========================= */
+
+function buildMessageContext_(message, labelName, config, parsed) {
+  const receivedDate = message.getDate();
+  const person = mapLabelToPerson_(labelName);
+  const year = Utilities.formatDate(receivedDate, config.timezone, 'yyyy');
+  const month = Utilities.formatDate(receivedDate, config.timezone, 'yyyy-MM');
+
+  const vendor = detectVendor_(message, parsed);
+  const orderNumber = extractOrderNumber_(message, parsed);
+
+  return {
+    messageId: message.getId(),
+    threadId: message.getThread().getId(),
+    labelName: labelName,
+    person: person,
+    from: message.getFrom(),
+    subject: message.getSubject(),
+    receivedAtIso: receivedDate.toISOString(),
+    year: year,
+    month: month,
+    vendor: vendor || 'UnknownVendor',
+    orderNumber: orderNumber || '',
+    shortId: message.getId().slice(-8),
+    datePart: Utilities.formatDate(receivedDate, config.timezone, 'ddMMM')
+  };
+}
 
 function mapLabelToPerson_(labelName) {
   if (labelName === 'archana-expenses') return 'archana';
@@ -1365,59 +1708,6 @@ function getFirstAttachmentName_(attachments) {
   return String(first.filename || first.name || '');
 }
 
-function guessVendorFromText_(text) {
-  const value = String(text || '').trim();
-  if (!value) return null;
-
-  const knownPatterns = [
-    { pattern: /pop\s*mart/i, vendor: 'PopMart' },
-    { pattern: /hampers\s*&\s*co/i, vendor: 'HampersAndCo' },
-    { pattern: /amazon/i, vendor: 'Amazon' },
-    { pattern: /uber/i, vendor: 'Uber' },
-    { pattern: /lyft/i, vendor: 'Lyft' },
-    { pattern: /starbucks/i, vendor: 'Starbucks' },
-    { pattern: /walmart/i, vendor: 'Walmart' },
-    { pattern: /target/i, vendor: 'Target' },
-    { pattern: /devine/i, vendor: 'Devines' }
-  ];
-
-  for (let i = 0; i < knownPatterns.length; i += 1) {
-    if (knownPatterns[i].pattern.test(value)) {
-      return knownPatterns[i].vendor;
-    }
-  }
-
-  const cleaned = value
-    .replace(/\.[A-Za-z0-9]+$/g, '')
-    .replace(/[_-]+/g, ' ')
-    .replace(/[^\w\s&]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-
-  if (!cleaned) return null;
-
-  const token = cleaned.split(' ').slice(0, 3).join(' ');
-  return sanitizeVendor_(token);
-}
-
-function normalizeVendorFromDomain_(domain) {
-  const value = String(domain || '').toLowerCase();
-
-  const stripped = value
-    .replace(/^mail\./, '')
-    .replace(/^accounts\./, '')
-    .replace(/^invoices\./, '')
-    .replace(/^notifications\./, '');
-
-  const parts = stripped.split('.');
-  if (parts.length < 2) return null;
-
-  const core = parts[parts.length - 2];
-  if (!core) return null;
-
-  return sanitizeVendor_(core);
-}
-
 function sanitizeVendor_(value) {
   const cleaned = String(value || '')
     .replace(/[^\w]+/g, ' ')
@@ -1427,7 +1717,9 @@ function sanitizeVendor_(value) {
 
   return cleaned
     .split(/\s+/)
-    .map(part => part.charAt(0).toUpperCase() + part.slice(1).toLowerCase())
+    .map(function (part) {
+      return part.charAt(0).toUpperCase() + part.slice(1).toLowerCase();
+    })
     .join('');
 }
 
@@ -1463,6 +1755,24 @@ function extractForwardedDomainVendor_(plainBody) {
   return normalizeVendorFromDomain_(match[1]);
 }
 
+function normalizeVendorFromDomain_(domain) {
+  const value = String(domain || '').toLowerCase();
+
+  const stripped = value
+    .replace(/^mail\./, '')
+    .replace(/^accounts\./, '')
+    .replace(/^invoices\./, '')
+    .replace(/^notifications\./, '');
+
+  const parts = stripped.split('.');
+  if (parts.length < 2) return null;
+
+  const core = parts[parts.length - 2];
+  if (!core) return null;
+
+  return sanitizeVendor_(core);
+}
+
 function guessVendorFromKnownPatterns_(text) {
   const value = String(text || '').trim();
   if (!value) return '';
@@ -1476,7 +1786,8 @@ function guessVendorFromKnownPatterns_(text) {
     { pattern: /lyft/i, vendor: 'Lyft' },
     { pattern: /starbucks/i, vendor: 'Starbucks' },
     { pattern: /walmart/i, vendor: 'Walmart' },
-    { pattern: /target/i, vendor: 'Target' }
+    { pattern: /target/i, vendor: 'Target' },
+    { pattern: /united/i, vendor: 'United' }
   ];
 
   for (let i = 0; i < knownPatterns.length; i += 1) {
@@ -1585,18 +1896,13 @@ function normalizeReferenceForFilename_(value) {
     .trim();
 }
 
-function buildEmailBodyPdfFilename_(context) {
-  const ref = context.orderNumber || context.shortId;
-  return `${context.datePart}-${context.vendor}-${ref}-email-body.pdf`;
-}
-
 function buildAttachmentOutputName_(context, attachment) {
   const originalName =
     sanitizeFilename_(attachment.filename) ||
-    `attachment.${guessExtensionFromMime_(attachment.mimeType) || 'bin'}`;
+    'attachment.' + (guessExtensionFromMime_(attachment.mimeType) || 'bin');
 
   const ref = context.orderNumber || context.shortId;
-  return `${context.datePart}-${context.vendor}-${ref}-${originalName}`;
+  return context.datePart + '-' + context.vendor + '-' + ref + '-' + originalName;
 }
 
 /* =========================
@@ -1623,24 +1929,37 @@ function assertAdvancedGmailEnabled_() {
   }
 }
 
+function mergeObjects_(base, extra) {
+  const result = {};
+  Object.keys(base || {}).forEach(function (key) {
+    result[key] = base[key];
+  });
+  Object.keys(extra || {}).forEach(function (key) {
+    result[key] = extra[key];
+  });
+  return result;
+}
+
 /* =========================
  * TRIGGER / RESET
  * ========================= */
 
 function installWeeklyTrigger() {
-  ScriptApp.getProjectTriggers().forEach(trigger => {
+  // Remove older copies of the same trigger first.
+  ScriptApp.getProjectTriggers().forEach(function (trigger) {
     if (trigger.getHandlerFunction() === 'runReceiptIngestion') {
       ScriptApp.deleteTrigger(trigger);
     }
   });
 
+  // Install a new weekly trigger for Thursday at 5 PM.
   ScriptApp.newTrigger('runReceiptIngestion')
     .timeBased()
-    .onWeekDay(ScriptApp.WeekDay.FRIDAY)
+    .onWeekDay(ScriptApp.WeekDay.THURSDAY)
     .atHour(17)
     .create();
 
-  Logger.log('Weekly trigger installed for Friday around 5 PM.');
+  Logger.log('Weekly trigger installed for Thursday around 5 PM.');
 }
 
 function resetTestProcessedState() {
@@ -1648,29 +1967,29 @@ function resetTestProcessedState() {
 
   const processedLabel = GmailApp.getUserLabelByName(config.processedLabel);
   const reviewLabel = GmailApp.getUserLabelByName(config.reviewLabel);
+  const ignoredLabel = GmailApp.getUserLabelByName(config.ignoredLabel);
 
   let updatedThreads = 0;
 
-  config.labels.forEach(labelName => {
-    const query = `label:${labelName}`;
+  config.labels.forEach(function (labelName) {
+    const query = 'label:' + labelName;
     const threads = GmailApp.search(query, 0, 200);
 
-    threads.forEach(thread => {
-      if (processedLabel) {
-        thread.removeLabel(processedLabel);
-      }
-
-      if (reviewLabel) {
-        thread.removeLabel(reviewLabel);
-      }
-
+    threads.forEach(function (thread) {
+      if (processedLabel) thread.removeLabel(processedLabel);
+      if (reviewLabel) thread.removeLabel(reviewLabel);
+      if (ignoredLabel) thread.removeLabel(ignoredLabel);
       updatedThreads += 1;
     });
   });
 
   PropertiesService.getScriptProperties().deleteProperty('PROCESSED_MESSAGE_IDS');
   PropertiesService.getScriptProperties().deleteProperty('PROCESSED_RECEIPT_KEYS');
+  PropertiesService.getScriptProperties().deleteProperty('REVIEWED_MESSAGE_IDS');
+  PropertiesService.getScriptProperties().deleteProperty('IGNORED_NON_RECEIPT_MESSAGE_IDS');
 
-  Logger.log(`Reset complete. Updated threads: ${updatedThreads}`);
-  Logger.log('Removed processed/review labels and cleared PROCESSED_MESSAGE_IDS and PROCESSED_RECEIPT_KEYS.');
+  Logger.log('Reset complete. Updated threads: ' + updatedThreads);
+  Logger.log(
+    'Removed processed/review/ignored labels and cleared PROCESSED_MESSAGE_IDS, PROCESSED_RECEIPT_KEYS, REVIEWED_MESSAGE_IDS, and IGNORED_NON_RECEIPT_MESSAGE_IDS.'
+  );
 }
