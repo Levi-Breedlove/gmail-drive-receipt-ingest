@@ -94,9 +94,11 @@ Example:
 
 ## Gmail Labels
 
-The workflow expects Gmail labels like:
+The workflow currently expects Gmail labels like:
 
-- `johndoe-expenses`
+- `archana-expenses`
+- `dan-expenses`
+- `rhea-expenses`
 
 It also uses processing labels such as:
 
@@ -104,6 +106,185 @@ It also uses processing labels such as:
 - `receipt-needs-review-test`
 
 The source label determines which person folder the receipt is routed into.
+
+## How to Change Label Names
+
+If you want to use different Gmail label names, you need to update both:
+
+1. the labels in Gmail
+2. the labels expected by the script
+
+### Step 1: Create or rename the labels in Gmail
+
+In the Gmail account that the script uses, create the labels you want the workflow to monitor.
+
+Examples:
+
+- `bob-expenses`
+- `sarah-expenses`
+- `mike-expenses`
+
+Apply those labels to the receipt emails you want the workflow to ingest.
+
+### Step 2: Update the label list in the script configuration
+
+Update the `LABELS` value in the script so it matches the Gmail labels you created.
+
+Example:
+
+```javascript
+LABELS: 'bob-expenses,sarah-expenses,mike-expenses'
+```
+
+If you are using Script Properties directly, make sure the `LABELS` property matches the same comma-separated values.
+
+Example:
+
+```text
+LABELS=bob-expenses,sarah-expenses,mike-expenses
+```
+
+### Step 3: Update the label-to-folder mapping in code
+
+If your current script still uses a hardcoded `mapLabelToPerson_()` function, update it so the new label names route to the correct Drive folder names.
+
+Example:
+
+```javascript
+function mapLabelToPerson_(labelName) {
+  if (labelName === 'bob-expenses') return 'bob';
+  if (labelName === 'sarah-expenses') return 'sarah';
+  if (labelName === 'mike-expenses') return 'mike';
+  return 'unknown';
+}
+```
+
+This means:
+
+- `bob-expenses` → `bob/`
+- `sarah-expenses` → `sarah/`
+- `mike-expenses` → `mike/`
+
+## Code Changes Required for Label Mapping
+
+This project does **not** automatically infer new Gmail label names from nowhere.
+
+If you change the Gmail labels, you must update the script in these two places.
+
+### 1. Change the `LABELS` value in `setupConfig()`
+
+Find this section in the code:
+
+```javascript
+function setupConfig() {
+  const props = PropertiesService.getScriptProperties();
+
+  props.setProperties(
+    {
+      ROOT_FOLDER_NAME: 'Receipts Archive',
+      TEST_SUBROOT_NAME: '_TEST',
+      PROCESSED_LABEL: 'receipt-ingested-test',
+      REVIEW_LABEL: 'receipt-needs-review-test',
+      LABELS: 'archana-expenses,dan-expenses,rhea-expenses',
+      TIMEZONE: 'America/Los_Angeles',
+      DRY_RUN: 'true',
+
+      // Artifact controls
+      SAVE_HTML: 'false',
+      SAVE_PDF: 'true',
+      SAVE_RAW_EMAIL: 'false',
+      SAVE_MANIFEST: 'false',
+      SAVE_ATTACHMENTS: 'true',
+      SAVE_INLINE_IMAGE_FILES: 'false'
+    },
+    true
+  );
+
+  Logger.log('Config saved to Script Properties.');
+}
+```
+
+Replace this line:
+
+```javascript
+LABELS: 'archana-expenses,dan-expenses,rhea-expenses',
+```
+
+with your own labels, for example:
+
+```javascript
+LABELS: 'bob-expenses,sarah-expenses,mike-expenses',
+```
+
+### 2. Change the `mapLabelToPerson_()` function
+
+Find this function in the code:
+
+```javascript
+function mapLabelToPerson_(labelName) {
+  if (labelName === 'archana-expenses') return 'archana';
+  if (labelName === 'dan-expenses') return 'dan';
+  if (labelName === 'rhea-expenses') return 'rhea';
+  return 'unknown';
+}
+```
+
+Replace it with your own mappings, for example:
+
+```javascript
+function mapLabelToPerson_(labelName) {
+  if (labelName === 'bob-expenses') return 'bob';
+  if (labelName === 'sarah-expenses') return 'sarah';
+  if (labelName === 'mike-expenses') return 'mike';
+  return 'unknown';
+}
+```
+
+### 3. Make sure Gmail label names and code values match exactly
+
+These values must line up exactly:
+
+- the label you create in Gmail
+- the label string inside `LABELS`
+- the label string inside `mapLabelToPerson_()`
+
+Example:
+
+```text
+Gmail label: bob-expenses
+LABELS value: bob-expenses
+mapLabelToPerson_(): if (labelName === 'bob-expenses') return 'bob';
+```
+
+If these do not match exactly, the script will not route the email into the correct folder.
+
+### 4. Re-run setup and verification
+
+After changing label names in Gmail and in the script, run:
+
+```javascript
+setupConfig()
+verifySetup()
+dryRunScan()
+```
+
+That confirms the new labels are recognized before you do a live ingestion run.
+
+### Optional: Change processing labels too
+
+If you also want to rename the processing labels, update:
+
+- `PROCESSED_LABEL`
+- `REVIEW_LABEL`
+
+Example:
+
+```javascript
+PROCESSED_LABEL: 'receipt-ingested-test',
+REVIEW_LABEL: 'receipt-needs-review-test'
+```
+
+If you rename those, make sure the new labels exist in Gmail too.
 
 ## Required Google Apps Script Services
 
