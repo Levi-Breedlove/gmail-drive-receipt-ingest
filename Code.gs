@@ -5,6 +5,7 @@
  * - Uses Advanced Gmail service for richer MIME/body access
  * - Saves a PDF converted from a self-contained HTML snapshot of the email body
  * - Saves regular attachments separately
+ * - Ignores attached .eml files completely
  * - Embeds cid:inline images into the HTML snapshot
  * - Best-effort fetches remote images used by <img src="..."> and CSS url(...)
  * - Skips remote image failures and keeps moving
@@ -57,7 +58,7 @@ function setupConfig() {
       // Fetch remote images for better PDF fidelity, best-effort only.
       FETCH_REMOTE_IMAGES: 'true',
 
-      // New: do not save .eml attachments
+      // Ignore nested .eml attachments entirely.
       IGNORE_EML_ATTACHMENTS: 'true'
     },
     true
@@ -92,7 +93,9 @@ function getConfig_() {
     saveInlineImageFiles:
       String(props.getProperty('SAVE_INLINE_IMAGE_FILES')).toLowerCase() === 'true',
     fetchRemoteImages:
-      String(props.getProperty('FETCH_REMOTE_IMAGES')).toLowerCase() === 'true'
+      String(props.getProperty('FETCH_REMOTE_IMAGES')).toLowerCase() === 'true',
+    ignoreEmlAttachments:
+      String(props.getProperty('IGNORE_EML_ATTACHMENTS')).toLowerCase() === 'true'
   };
 }
 
@@ -208,6 +211,7 @@ function dryRunScan() {
   Logger.log('DRY_RUN = ' + config.dryRun);
   Logger.log('MIN_EMAIL_DATE = ' + config.minEmailDate);
   Logger.log('FETCH_REMOTE_IMAGES = ' + config.fetchRemoteImages);
+  Logger.log('IGNORE_EML_ATTACHMENTS = ' + config.ignoreEmlAttachments);
   Logger.log('RECEIPT_THRESHOLD = ' + config.receiptThreshold);
   Logger.log('REVIEW_THRESHOLD = ' + config.reviewThreshold);
 
@@ -276,6 +280,9 @@ function buildPlannedActions_(config, parsed, decision) {
     }
     if (config.fetchRemoteImages) {
       actions.push('best-effort-inline-remote-images');
+    }
+    if (config.ignoreEmlAttachments) {
+      actions.push('ignore-eml-attachments');
     }
     actions.push('mark-processed');
   } else if (decision === 'review') {
@@ -510,7 +517,7 @@ function inspectThreadForReceipt_(thread, config) {
 
     inspectedCount += 1;
 
-    const apiBundle = getApiMessageBundle_(message.getId());
+    const apiBundle = getApiMessageBundle_(message.getId(), config);
     const receiptCheck = classifyReceiptMessage_(message, apiBundle.parsed, config);
 
     const candidate = {
@@ -717,9 +724,9 @@ function containsCurrencyAmount_(text) {
  * GMAIL API PARSING
  * ========================= */
 
-function getApiMessageBundle_(messageId) {
+function getApiMessageBundle_(messageId, config) {
   const fullMessage = Gmail.Users.Messages.get('me', messageId, { format: 'full' });
-  const parsed = parseApiMessage_(fullMessage);
+  const parsed = parseApiMessage_(fullMessage, config);
 
   return {
     fullMessage: fullMessage,
@@ -727,7 +734,7 @@ function getApiMessageBundle_(messageId) {
   };
 }
 
-function parseApiMessage_(apiMessage) {
+function parseApiMessage_(apiMessage, config) {
   const state = {
     htmlCandidates: [],
     plainCandidates: [],
@@ -739,7 +746,7 @@ function parseApiMessage_(apiMessage) {
     messageId: apiMessage.id
   };
 
-  walkMimePart_(apiMessage.payload, apiMessage.id, state);
+  walkMimePart_(apiMessage.payload, apiMessage.id, state, config);
 
   const bestHtml = chooseBestCandidate_(state.htmlCandidates);
   const bestPlain = chooseBestCandidate_(state.plainCandidates);
@@ -758,7 +765,7 @@ function parseApiMessage_(apiMessage) {
   };
 }
 
-function walkMimePart_(part, messageId, state) {
+function walkMimePart_(part, messageId, state, config) {
   if (!part) return;
 
   const mimeType = String(part.mimeType || '').toLowerCase();
@@ -772,7 +779,7 @@ function walkMimePart_(part, messageId, state) {
 
   if (hasChildParts) {
     part.parts.forEach(function (child) {
-      walkMimePart_(child, messageId, state);
+      walkMimePart_(child, messageId, state, config);
     });
   }
 
@@ -820,6 +827,16 @@ function walkMimePart_(part, messageId, state) {
   }
 
   if (filename || disposition.indexOf('attachment') > -1 || isLikelyAttachmentMime_(mimeType)) {
+    if (config && config.ignoreEmlAttachments && isEmlAttachment_(filename, mimeType)) {
+      Logger.log(
+        'Skipping .eml attachment for message ' +
+          messageId +
+          ': ' +
+          (filename || '[unnamed-eml]')
+      );
+      return;
+    }
+
     const bytes = getPartBytes_(messageId, part);
     if (bytes.length > 0) {
       state.regularAttachments.push({
@@ -829,6 +846,17 @@ function walkMimePart_(part, messageId, state) {
       });
     }
   }
+}
+
+function isEmlAttachment_(filename, mimeType) {
+  const name = String(filename || '').toLowerCase().trim();
+  const mime = String(mimeType || '').toLowerCase().trim();
+
+  return (
+    name.endsWith('.eml') ||
+    mime === 'message/rfc822' ||
+    mime.indexOf('message/') === 0
+  );
 }
 
 function chooseBestCandidate_(candidates) {
