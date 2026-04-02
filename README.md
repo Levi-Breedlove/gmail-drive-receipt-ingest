@@ -1,73 +1,61 @@
-# gmail-receipt-to-drive-pdf
+# Gmail Drive Receipt Ingest
 
-Google Apps Script workflow that ingests labeled receipt emails from Gmail, converts the email body to a PDF with inline images preserved as closely as possible, saves original attachments to Google Drive, organizes output by person and month, and generates cleaner filenames using the email date, vendor, and order or reference number.
+Google Apps Script workflow that turns labeled Gmail receipt emails into a clean, searchable Google Drive archive.
 
-## Overview
+It scans receipt emails from configured Gmail labels, routes them to person-specific folders, converts the email body into a PDF, saves supported attachments, and names files using the receipt date, vendor, and order or reference number.
 
-This project automates a receipt-ingestion flow using Gmail labels and Google Drive.
+## Why this exists
 
-It monitors labeled Gmail emails, identifies which person a receipt belongs to based on the applied label, renders the email body into a PDF artifact, preserves inline images inside that rendered PDF as closely as Apps Script allows, saves original attachments such as PDF and image files, and stores everything in a structured Google Drive archive.
+This project was built around a real executive receipt-management use case.
 
-The archive is organized by:
+The goal was to reduce manual sorting by automatically:
 
-- person
-- year
-- month
+- pulling receipt emails from Gmail
+- organizing them in Google Drive
+- preserving the readable email body as a PDF
+- saving original receipt attachments
+- creating cleaner filenames for long-term retrieval
 
-The output filenames are designed to be cleaner and more searchable by using:
+## What it does
 
-- email date
-- vendor name
-- order or reference number
-
-## What This Project Does
-
-- Reads Gmail messages from configured labels
-- Maps each label to a person folder
-- Parses the email body and inline image content
+- Reads receipt emails from configured Gmail labels
+- Maps each source label to a person folder
+- Parses HTML, plain text, inline images, and attachments
 - Converts the email body into a PDF
+- Preserves important inline images as closely as Apps Script allows
 - Saves original attachments into Drive
-- Organizes output into person/year/month folders
+- Organizes output by person, year, and month
 - Marks processed messages to prevent duplicate ingestion
 - Supports dry-run testing before real file writes
-- Generates cleaner filenames based on extracted receipt information
-- Restricts processing to emails dated **2026-01-01 and onward**
+- Routes uncertain items to review
+- Ignores attached `.eml` files
+- Restricts processing to emails on or after a configured minimum date
 
-## Current Output Behavior
+## How the workflow works
 
-For each processed email, the workflow saves:
+1. A receipt email is labeled in Gmail
+2. The script checks whether the message qualifies for processing
+3. The source label is mapped to a person folder
+4. The email body is rendered into a PDF
+5. Supported attachments are saved to an `_attachments` folder
+6. The files are renamed using extracted receipt context
+7. The message is marked as processed so it does not run again
 
-1. **Email body PDF**
-   - rendered from the email body
-   - inline images are preserved as closely as possible
-   - remote image fetching is limited to avoid bloated or looping image fetches
+## Output structure
 
-2. **Original attachments**
-   - PDF, PNG, JPG, and other supported files
-   - stored in an `_attachments` subfolder when present
-
-The current workflow does **not** save:
-
-- HTML body files
-- raw `.eml` files
-- manifest JSON files
-- full rendered PNG screenshots of the email body
-
-## Folder Structure
-
-```text
+~~~text
 Receipts Archive/
   _TEST/
-    user1/
+    archana/
       2026/
         2026-03/
           31Mar-HampersAndCo-W56606-email-body.pdf
           _attachments/
-            31Mar-HampersAndCo-W56606-original-file.pdf
-    user2/
+            31Mar-HampersAndCo-W56606-Trip_Receipt.pdf
+    dan/
       2026/
         2026-03/
-    user3/
+    rhea/
       2026/
         2026-03/
     _Needs Review/
@@ -75,37 +63,59 @@ Receipts Archive/
       dan/
       rhea/
     _Logs/
-```
+~~~
 
-## File Naming
+## File naming
 
-The workflow generates filenames using this pattern:
+Generated files follow this general pattern:
 
-```text
+~~~text
 DDMon-Vendor-OrderOrReference-email-body.pdf
-```
+~~~
 
 Examples:
 
-```text
+~~~text
 31Mar-HampersAndCo-W56606-email-body.pdf
 31Mar-PopMart-O1843507719879487488-email-body.pdf
 31Mar-Devines-360069x2-email-body.pdf
-```
+~~~
 
-Attachment filenames follow the same general naming pattern and preserve the original attachment name after the receipt context prefix.
+Attachments follow the same general naming style and keep the original filename after the receipt context prefix.
 
 Example:
 
-```text
+~~~text
 31Mar-Devines-360069x2-Trip_Receipt_360069x2.pdf
-```
+~~~
 
-## Gmail Labels
+## Current behavior
 
-The workflow currently expects Gmail labels like:
+For each processed email, the workflow currently saves:
 
-- `user1-expenses`
+1. **Email body PDF**
+   - rendered from the email body
+   - inline images preserved as closely as possible
+   - remote image fetching handled on a best-effort basis
+
+2. **Original attachments**
+   - PDFs, images, and other supported file types
+   - stored in an `_attachments` subfolder when present
+
+The workflow currently does **not** save:
+
+- raw `.eml` files
+- HTML snapshots as separate files
+- manifest JSON files
+- browser-rendered PNG screenshots of the email body
+
+## Gmail labels
+
+The script expects source labels like:
+
+- `archana-expenses`
+- `dan-expenses`
+- `rhea-expenses`
 
 It also uses processing labels such as:
 
@@ -114,228 +124,18 @@ It also uses processing labels such as:
 
 The source label determines which person folder the receipt is routed into.
 
-## How to Change Label Names
+## Setup
 
-If you want to use different Gmail label names, you need to update both:
+### 1. Add the script files
 
-1. the labels in Gmail
-2. the labels expected by the script
+Create a Google Apps Script project and add:
 
-### Step 1: Create or rename the labels in Gmail
+- `Code.gs`
+- `appsscript.json`
 
-In the Gmail account that the script uses, create the labels you want the workflow to monitor.
+### 2. Enable required services
 
-Examples:
-
-- `bob-expenses`
-- `sarah-expenses`
-- `mike-expenses`
-
-Apply those labels to the receipt emails you want the workflow to ingest.
-
-### Step 2: Update the label list in the script configuration
-
-Update the `LABELS` value in the script so it matches the Gmail labels you created.
-
-Example:
-
-```javascript
-LABELS: 'bob-expenses,sarah-expenses,mike-expenses'
-```
-
-If you are using Script Properties directly, make sure the `LABELS` property matches the same comma-separated values.
-
-Example:
-
-```text
-LABELS=bob-expenses,sarah-expenses,mike-expenses
-```
-
-### Step 3: Update the label-to-folder mapping in code
-
-The current script uses a hardcoded `mapLabelToPerson_()` function.
-
-If you change the label names, you must also change the mapping.
-
-Example:
-
-```javascript
-function mapLabelToPerson_(labelName) {
-  if (labelName === 'bob-expenses') return 'bob';
-  if (labelName === 'sarah-expenses') return 'sarah';
-  if (labelName === 'mike-expenses') return 'mike';
-  return 'unknown';
-}
-```
-
-This means:
-
-- `bob-expenses` → `bob/`
-- `sarah-expenses` → `sarah/`
-- `mike-expenses` → `mike/`
-
-## Code Changes Required for Label Mapping
-
-This project does **not** automatically infer new Gmail label names from nowhere.
-
-If you change the Gmail labels, you must update the script in these two places.
-
-### 1. Change the `LABELS` value in `setupConfig()`
-
-Find this section in the code:
-
-```javascript
-function setupConfig() {
-  const props = PropertiesService.getScriptProperties();
-
-  props.setProperties(
-    {
-      ROOT_FOLDER_NAME: 'Receipts Archive',
-      TEST_SUBROOT_NAME: '_TEST',
-      PROCESSED_LABEL: 'receipt-ingested-test',
-      REVIEW_LABEL: 'receipt-needs-review-test',
-      LABELS: 'archana-expenses,dan-expenses,rhea-expenses',
-      TIMEZONE: 'America/Los_Angeles',
-      DRY_RUN: 'true',
-      MIN_EMAIL_DATE: '2026-01-01',
-
-      SAVE_HTML: 'false',
-      SAVE_PDF: 'true',
-      SAVE_RAW_EMAIL: 'false',
-      SAVE_MANIFEST: 'false',
-      SAVE_ATTACHMENTS: 'true',
-      SAVE_INLINE_IMAGE_FILES: 'false'
-    },
-    true
-  );
-
-  Logger.log('Config saved to Script Properties.');
-}
-```
-
-Replace this line:
-
-```javascript
-LABELS: 'archana-expenses,dan-expenses,rhea-expenses',
-```
-
-with your own labels, for example:
-
-```javascript
-LABELS: 'bob-expenses,sarah-expenses,mike-expenses',
-```
-
-### 2. Change the `mapLabelToPerson_()` function
-
-Find this function in the code:
-
-```javascript
-function mapLabelToPerson_(labelName) {
-  if (labelName === 'archana-expenses') return 'archana';
-  if (labelName === 'dan-expenses') return 'dan';
-  if (labelName === 'rhea-expenses') return 'rhea';
-  return 'unknown';
-}
-```
-
-Replace it with your own mappings, for example:
-
-```javascript
-function mapLabelToPerson_(labelName) {
-  if (labelName === 'bob-expenses') return 'bob';
-  if (labelName === 'sarah-expenses') return 'sarah';
-  if (labelName === 'mike-expenses') return 'mike';
-  return 'unknown';
-}
-```
-
-### 3. Make sure Gmail label names and code values match exactly
-
-These values must line up exactly:
-
-- the label you create in Gmail
-- the label string inside `LABELS`
-- the label string inside `mapLabelToPerson_()`
-
-Example:
-
-```text
-Gmail label: bob-expenses
-LABELS value: bob-expenses
-mapLabelToPerson_(): if (labelName === 'bob-expenses') return 'bob';
-```
-
-If these do not match exactly, the script will not route the email into the correct folder.
-
-### 4. Re-run setup and verification
-
-After changing label names in Gmail and in the script, run:
-
-```javascript
-setupConfig()
-verifySetup()
-dryRunScan()
-```
-
-That confirms the new labels are recognized before you do a live ingestion run.
-
-### Optional: Change processing labels too
-
-If you also want to rename the processing labels, update:
-
-- `PROCESSED_LABEL`
-- `REVIEW_LABEL`
-
-Example:
-
-```javascript
-PROCESSED_LABEL: 'receipt-ingested-test',
-REVIEW_LABEL: 'receipt-needs-review-test'
-```
-
-If you rename those, make sure the new labels exist in Gmail too.
-
-## Date Filtering
-
-The current workflow only processes emails from **2026-01-01 and onward**.
-
-This is controlled by the `MIN_EMAIL_DATE` setting.
-
-Example:
-
-```javascript
-MIN_EMAIL_DATE: '2026-01-01',
-```
-
-The script enforces this in two ways:
-
-1. it adds an `after:` filter to the Gmail search query
-2. it checks each message date again in code before processing
-
-### How to change the minimum date
-
-If you want to change the date cutoff, update:
-
-```javascript
-MIN_EMAIL_DATE: '2026-01-01',
-```
-
-to something else, for example:
-
-```javascript
-MIN_EMAIL_DATE: '2027-01-01',
-```
-
-Then re-run:
-
-```javascript
-setupConfig()
-dryRunScan()
-```
-
-## Required Google Apps Script Services
-
-### Built-in services
+Built-in Apps Script services used:
 
 - `GmailApp`
 - `DriveApp`
@@ -344,18 +144,18 @@ dryRunScan()
 - `ScriptApp`
 - `UrlFetchApp`
 
-### Advanced services
+Advanced services required:
 
 - `Gmail`
 - `Drive`
 
-## Required Manifest Configuration
+### 3. Confirm manifest scopes
 
-Your `appsscript.json` should include the enabled advanced services and required OAuth scopes.
+Your `appsscript.json` should include the required advanced services and OAuth scopes.
 
 Example:
 
-```json
+~~~json
 {
   "timeZone": "America/Los_Angeles",
   "dependencies": {
@@ -380,9 +180,9 @@ Example:
     "https://www.googleapis.com/auth/script.external_request"
   ]
 }
-```
+~~~
 
-## Script Configuration
+## Configuration
 
 The project uses Script Properties for configuration.
 
@@ -398,157 +198,248 @@ Typical properties include:
 - `MIN_EMAIL_DATE`
 - `SAVE_PDF`
 - `SAVE_ATTACHMENTS`
+- `FETCH_REMOTE_IMAGES`
+- `IGNORE_EML_ATTACHMENTS`
 
-## Commands to Run
+### Default config example
 
-### First-time setup
+~~~javascript
+function setupConfig() {
+  const props = PropertiesService.getScriptProperties();
+
+  props.setProperties(
+    {
+      ROOT_FOLDER_NAME: 'Receipts Archive',
+      TEST_SUBROOT_NAME: '_TEST',
+      PROCESSED_LABEL: 'receipt-ingested-test',
+      REVIEW_LABEL: 'receipt-needs-review-test',
+      LABELS: 'archana-expenses,dan-expenses,rhea-expenses',
+      TIMEZONE: 'America/Los_Angeles',
+      DRY_RUN: 'true',
+      MIN_EMAIL_DATE: '2026-01-01',
+      SAVE_HTML: 'false',
+      SAVE_PDF: 'true',
+      SAVE_RAW_EMAIL: 'false',
+      SAVE_MANIFEST: 'false',
+      SAVE_ATTACHMENTS: 'true',
+      SAVE_INLINE_IMAGE_FILES: 'false',
+      FETCH_REMOTE_IMAGES: 'true',
+      IGNORE_EML_ATTACHMENTS: 'true'
+    },
+    true
+  );
+
+  Logger.log('Config saved to Script Properties.');
+}
+~~~
+
+## First-time run
 
 Run these functions in order:
 
-```javascript
+~~~javascript
 setupConfig()
 verifySetup()
 dryRunScan()
-```
+~~~
 
-### Real processing run
+What they do:
 
-After dry run looks correct:
+- `setupConfig()` writes the initial Script Properties
+- `verifySetup()` confirms labels, folders, services, and access
+- `dryRunScan()` shows what would happen without writing files
 
-```javascript
+## Real processing run
+
+After the dry run looks correct, run:
+
+~~~javascript
 resetTestProcessedState()
 setDryRunFalse()
 runReceiptIngestion()
-```
+~~~
 
-### Re-run test emails again
+## Re-run test emails
 
-If you already processed the test emails and want to test again:
+If you want to test already-processed emails again:
 
-```javascript
+~~~javascript
 resetTestProcessedState()
 dryRunScan()
 setDryRunFalse()
 runReceiptIngestion()
-```
+~~~
 
-## Optional Scheduling
+## Scheduling
 
-To make the script run automatically on a schedule, install the weekly trigger:
+To automate processing, install the weekly trigger:
 
-```javascript
+~~~javascript
 installWeeklyTrigger()
-```
+~~~
 
-This creates a recurring trigger for `runReceiptIngestion()`.
+Current helper behavior:
 
-### Current trigger behavior
-
-The current helper creates a weekly trigger for:
-
-- `runReceiptIngestion()`
+- runs `runReceiptIngestion()`
+- weekly
 - Friday
 - around 5 PM
 
-## Running This Script in Another Person's Gmail Account
+## Running this in another person’s Gmail account
 
-If this workflow is used in another person’s Gmail account, that person should authorize the script and create the installable trigger from their own account.
+If this workflow is used in another person’s Gmail account, that user should authorize the script and create the installable trigger from their own account.
 
-Recommended setup for another user:
+Recommended flow:
 
-1. copy or open the script in that user’s Google account
-2. enable the required Apps Script services
-3. authorize the script from that user’s account
-4. create the Gmail labels in that user’s Gmail
-5. create the Drive folders in that user’s Google Drive
-6. run:
+1. Open or copy the script into that user’s Google account
+2. Enable the required Apps Script services
+3. Authorize the script from that user’s account
+4. Create the Gmail labels in that user’s Gmail
+5. Create the Drive folder structure in that user’s Drive
+6. Run:
    - `setupConfig()`
    - `verifySetup()`
    - `dryRunScan()`
-7. install the trigger by running:
+7. Install the trigger with:
    - `installWeeklyTrigger()`
 
-If the trigger is created by a different account, the workflow may run under the wrong Gmail / Drive context.
+If the trigger is created by a different account, the workflow can run in the wrong Gmail or Drive context.
 
-## Key Functions
+## Changing label names
 
-### `setupConfig()`
+If you want to use different Gmail labels, update both:
 
-Writes initial Script Properties used by the workflow.
+1. the labels in Gmail
+2. the labels expected by the script
 
-### `verifySetup()`
+### Update the `LABELS` config
 
-Verifies Gmail labels, Drive folders, manifest access, and required service access.
+Example:
 
-### `dryRunScan()`
+~~~javascript
+LABELS: 'bob-expenses,sarah-expenses,mike-expenses'
+~~~
 
-Parses messages without writing files, so you can verify vendor extraction, order number extraction, attachment detection, minimum date filtering, and PDF naming safely.
+### Update the label-to-folder mapping
 
-### `resetTestProcessedState()`
+Example:
 
-Clears test processed-state tracking so test messages can be run again.
+~~~javascript
+function mapLabelToPerson_(labelName) {
+  if (labelName === 'bob-expenses') return 'bob';
+  if (labelName === 'sarah-expenses') return 'sarah';
+  if (labelName === 'mike-expenses') return 'mike';
+  return 'unknown';
+}
+~~~
 
-### `setDryRunFalse()`
+These values must match exactly:
 
-Switches the workflow out of dry-run mode.
+- the Gmail label
+- the value inside `LABELS`
+- the value inside `mapLabelToPerson_()`
 
-### `runReceiptIngestion()`
+After changing them, run:
 
-Processes matching labeled emails, writes files to Drive, and marks messages as processed.
+~~~javascript
+setupConfig()
+verifySetup()
+dryRunScan()
+~~~
 
-### `installWeeklyTrigger()`
+## Date filtering
 
-Creates a scheduled trigger so the workflow runs automatically instead of manually.
+The workflow currently only processes emails on or after:
 
-## How Vendor and Order Number Extraction Works
+~~~javascript
+MIN_EMAIL_DATE: '2026-01-01'
+~~~
 
-Vendor naming is based on best-effort extraction from:
+This is enforced in two ways:
 
-1. attachment names
-2. forwarded sender display name inside the email body
-3. known vendor patterns inside the actual email content
-4. HTML title or heading content
-5. forwarded sender domain
-6. cleaned subject fallback
+1. an `after:` filter is added to the Gmail query
+2. each message date is checked again in code before processing
+
+To change the cutoff, update `MIN_EMAIL_DATE` and rerun:
+
+~~~javascript
+setupConfig()
+dryRunScan()
+~~~
+
+## Receipt detection and naming
+
+Vendor naming is based on best-effort extraction from sources such as:
+
+- attachment names
+- sender display names inside forwarded content
+- known vendor patterns in the email body
+- HTML title or heading content
+- sender domain
+- cleaned subject fallback
 
 Order or reference numbers are extracted from:
 
 - subject line
-- plain body
-- HTML body text
+- plain text body
+- HTML body
 - attachment names
 
-This is intentionally heuristic and can be extended over time as new vendor formats appear.
+This is heuristic by design and can be extended as new receipt formats appear.
+
+## How images are handled
+
+The script tries to preserve images in the rendered PDF by:
+
+1. embedding `cid:` inline images from MIME parts
+2. fetching a limited number of remote `<img src="...">` assets
+3. converting those assets into data URIs before PDF generation
+
+To keep processing reliable, it also avoids or limits:
+
+- tracking pixels
+- beacon URLs
+- some static map or marker URLs
+- extremely long signed URLs
+- noisy image-heavy content that adds little archival value
 
 ## Idempotency
 
 The workflow avoids duplicate processing by:
 
-- adding a processed Gmail label
+- applying a processed Gmail label
 - storing processed message IDs in Script Properties
 
-Deleting the generated files from Drive does not automatically make the emails eligible again. For testing, use:
+Deleting files from Drive does **not** automatically make the original emails eligible again.
 
-```javascript
+For testing, use:
+
+~~~javascript
 resetTestProcessedState()
-```
+~~~
 
-## How Remote Images Are Handled
+## Key functions
 
-The script attempts to preserve images in the rendered PDF by:
+### `setupConfig()`
+Writes the base Script Properties used by the workflow.
 
-1. embedding `cid:` inline images from the email MIME parts
-2. fetching a limited number of remote `<img src="...">` images
-3. converting those images into data URIs before PDF conversion
+### `verifySetup()`
+Checks Gmail labels, Drive folders, manifest access, and required services.
 
-To avoid bloated loops or noisy ride / marketing emails, the script also:
+### `dryRunScan()`
+Simulates processing so you can validate naming, routing, and extraction before writing files.
 
-- caps remote image fetches
-- skips obvious tracking and beacon URLs
-- skips many static map / marker URLs
-- skips extremely long signed URLs
+### `resetTestProcessedState()`
+Clears test processed-state tracking so messages can be tested again.
 
-This helps keep PDF generation more reliable while still preserving the most important visible email images.
+### `setDryRunFalse()`
+Switches the workflow out of dry-run mode.
+
+### `runReceiptIngestion()`
+Processes matching emails, writes files to Drive, and marks messages as processed.
+
+### `installWeeklyTrigger()`
+Creates a recurring trigger so the script runs automatically.
 
 ## Limitations
 
@@ -557,18 +448,18 @@ This project is intentionally Apps Script-only.
 That means:
 
 - PDF generation is based on Apps Script blob conversion
-- visual fidelity is strong, but not the same as a true browser screenshot renderer
-- a full rendered email-body PNG screenshot is not supported cleanly in Apps Script-only server-side automation
+- output fidelity is strong, but not identical to a browser screenshot renderer
 - vendor extraction is heuristic, not guaranteed for every merchant format
-- some heavily proxied or authenticated remote images may still fail to appear in the PDF
+- some remote or authenticated images may still fail to render
+- full visual screenshot capture of the email body is not the goal of this workflow
 
-The best artifact in this workflow is the rendered PDF plus the original saved attachments.
+The strongest archival output in this project is the combination of:
 
-## Repository Purpose
-
-This repo exists to turn labeled Gmail receipt emails into a cleaner, searchable Google Drive archive with:
-
-- readable rendered email PDFs
-- preserved receipt attachments
+- rendered email-body PDF
+- preserved original attachments
 - structured folder organization
-- better filenames for long-term retrieval
+- cleaner searchable filenames
+
+## Repo purpose
+
+This repo exists to turn labeled Gmail receipt emails into a cleaner and more maintainable Google Drive archive for long-term receipt storage and retrieval.
