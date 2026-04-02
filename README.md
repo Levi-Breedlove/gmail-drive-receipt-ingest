@@ -46,22 +46,22 @@ The goal was to reduce manual sorting by automatically:
 ~~~text
 Receipts Archive/
   _TEST/
-    archana/
+    emailuser1/
       2026/
         2026-03/
           31Mar-HampersAndCo-W56606-email-body.pdf
           _attachments/
             31Mar-HampersAndCo-W56606-Trip_Receipt.pdf
-    dan/
+    emailuser2/
       2026/
         2026-03/
-    rhea/
+    emailuser3/
       2026/
         2026-03/
     _Needs Review/
-      archana/
-      dan/
-      rhea/
+      emailuser1/
+      emailuser2/
+      emailuser3/
     _Logs/
 ~~~
 
@@ -113,9 +113,9 @@ The workflow currently does **not** save:
 
 The script expects source labels like:
 
-- `archana-expenses`
-- `dan-expenses`
-- `rhea-expenses`
+- `bob-expenses`
+- `john-expenses`
+- `doe-expenses`
 
 It also uses processing labels such as:
 
